@@ -376,10 +376,10 @@ impl AppContextBuilder {
         self.rate_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
             n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
+                // An explicit zero selects strict concurrency admission. Validation
+                // rejects negative rates; keep unchecked construction fail-closed
+                // instead of casting a negative value to an enormous usize rate.
+                let rate_limit_tokens = config.rate_limit_tokens_per_second.unwrap_or(n).max(0);
                 Some(Arc::new(TokenBucket::new(
                     n as usize,
                     rate_limit_tokens as usize,
@@ -528,5 +528,60 @@ impl AppContextBuilder {
 impl Default for AppContextBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn explicit_zero_refill_rate_is_preserved() {
+        let config = RouterConfig {
+            max_concurrent_requests: 1_000,
+            rate_limit_tokens_per_second: Some(0),
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .unwrap();
+        assert!(bucket.try_acquire(1_000.0).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unspecified_refill_preserves_existing_rate_behavior() {
+        let config = RouterConfig {
+            max_concurrent_requests: 1_000,
+            rate_limit_tokens_per_second: None,
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .unwrap();
+        assert!(bucket.try_acquire(1_000.0).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn unchecked_negative_refill_does_not_wrap_to_unlimited_capacity() {
+        let config = RouterConfig {
+            max_concurrent_requests: 1,
+            rate_limit_tokens_per_second: Some(-1),
+            ..RouterConfig::default()
+        };
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .unwrap();
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(bucket.try_acquire(1.0).await.is_err());
     }
 }
