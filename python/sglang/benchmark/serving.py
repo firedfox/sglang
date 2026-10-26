@@ -27,6 +27,7 @@ import traceback
 import uuid
 import warnings
 from argparse import ArgumentParser
+from collections import Counter
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -54,7 +55,6 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -114,12 +114,21 @@ class RequestFuncOutput:
     error: str = ""
     output_len: int = 0
     start_time: float = 0.0
+    end_time: float | None = None
+    http_status: int | None = None
+    finish_reason: Any | None = None
+    # None means the backend did not report a count. Never substitute the
+    # requested output budget when auditing native SGLang responses.
+    completion_tokens: int | None = None
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    spec_verify_ct: int | None = None
+    spec_num_correct_drafts: int | None = None
+    spec_num_proposed_drafts: int | None = None
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -204,9 +213,11 @@ async def async_request_trt_llm(
 
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(url=api_url, json=payload) as response:
+                output.http_status = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -242,6 +253,8 @@ async def async_request_trt_llm(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        finally:
+            _record_request_end(output)
 
         if pbar:
             pbar.update(1)
@@ -284,6 +297,59 @@ def _record_server_prompt_len(data, output):
     prompt_tokens = reported.get("prompt_tokens")
     if prompt_tokens:
         output.prompt_len = prompt_tokens
+
+
+def _record_request_end(output: RequestFuncOutput) -> None:
+    """Keep transport-failure intervals available for concurrency/error audits."""
+    output.end_time = time.perf_counter()
+    if not output.success:
+        output.latency = output.end_time - output.start_time
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _request_speculative_metrics(outputs: list[RequestFuncOutput]) -> dict[str, Any]:
+    """Aggregate this run's successful responses, not one rank's lifetime mean.
+
+    Final per-request counters already include whichever DP rank served each
+    request. Only report a whole-run ratio when every success has counters;
+    averaging request ratios or a partial subset would silently change scope.
+    """
+    successful = [output for output in outputs if output.success]
+    covered = [
+        output
+        for output in successful
+        if output.completion_tokens is not None
+        and output.spec_verify_ct is not None
+        and output.spec_verify_ct > 0
+    ]
+    complete = bool(successful) and len(covered) == len(successful)
+    verify_count = sum(output.spec_verify_ct for output in covered)
+    completion_tokens = sum(output.completion_tokens for output in covered)
+    draft_covered = [
+        output
+        for output in covered
+        if output.spec_num_correct_drafts is not None
+        and output.spec_num_proposed_drafts is not None
+    ]
+    draft_complete = complete and len(draft_covered) == len(successful)
+    proposed = sum(output.spec_num_proposed_drafts for output in draft_covered)
+    correct = sum(output.spec_num_correct_drafts for output in draft_covered)
+    return {
+        "source": "successful_request_final_counters",
+        "successful_requests": len(successful),
+        "requests_with_verify_counters": len(covered),
+        "requests_with_draft_counters": len(draft_covered),
+        "complete": complete,
+        "accept_length": completion_tokens / verify_count if complete else None,
+        "accept_rate": correct / proposed if draft_complete and proposed else None,
+        "completion_tokens": completion_tokens if complete else None,
+        "verify_count": verify_count if complete else None,
+        "correct_drafts": correct if draft_complete else None,
+        "proposed_drafts": proposed if draft_complete else None,
+    }
 
 
 # set ignore_eos True by default
@@ -346,6 +412,7 @@ async def async_request_openai_completions(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.http_status = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -399,6 +466,8 @@ async def async_request_openai_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        finally:
+            _record_request_end(output)
 
     if pbar:
         pbar.update(1)
@@ -502,6 +571,7 @@ async def async_request_openai_chat_completions(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.http_status = response.status
                 if response.status == 200:
                     if args.disable_stream:
                         # Non-streaming response
@@ -594,6 +664,8 @@ async def async_request_openai_chat_completions(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        finally:
+            _record_request_end(output)
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -635,11 +707,13 @@ async def async_request_truss(
         generated_text = ""
         ttft = 0.0
         st = time.perf_counter()
+        output.start_time = st
         most_recent_timestamp = st
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.http_status = response.status
                 if response.status == 200:
                     async for chunk_bytes in response.content:
                         chunk_bytes = chunk_bytes.strip()
@@ -683,6 +757,8 @@ async def async_request_truss(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        finally:
+            _record_request_end(output)
 
     if pbar:
         pbar.update(1)
@@ -729,80 +805,119 @@ async def async_request_sglang_generate(
 
         output = RequestFuncOutput.init_new(request_func_input)
 
-        generated_text = ""
-        output_len = request_func_input.output_len
-        ttft = 0.0
         st = time.perf_counter()
         output.start_time = st
         most_recent_timestamp = st
         last_output_len = 0
+        saw_completion_tokens = False
+        saw_done = False
+
+        def record_response(data):
+            nonlocal most_recent_timestamp, last_output_len, saw_completion_tokens
+            if not isinstance(data, dict):
+                raise TypeError("Expected a native SGLang response object")
+
+            timestamp = time.perf_counter()
+            meta = data.get("meta_info") or {}
+            _record_server_prompt_len(data, output)
+            if isinstance(data.get("text"), str) and data["text"]:
+                output.generated_text = data["text"]
+            if meta.get("finish_reason") is not None:
+                output.finish_reason = meta["finish_reason"]
+
+            # Final metadata may carry counts with empty text (e.g. EOS or
+            # skipped special tokens). Counts are independent of visible text.
+            if "completion_tokens" in meta:
+                count = meta["completion_tokens"]
+                if not _nonnegative_int(count):
+                    raise ValueError("Invalid native completion_tokens")
+                if count < last_output_len:
+                    raise ValueError("Native completion_tokens decreased in a stream")
+                saw_completion_tokens = True
+                output.completion_tokens = output.output_len = count
+                num_new_tokens = count - last_output_len
+                if num_new_tokens > 0:
+                    if last_output_len == 0:
+                        output.ttft = timestamp - st
+                    else:
+                        # Preserve the existing chunk-interpolated ITL metric.
+                        chunk_gap = timestamp - most_recent_timestamp
+                        output.itl.extend([chunk_gap / num_new_tokens] * num_new_tokens)
+                    most_recent_timestamp = timestamp
+                    last_output_len = count
+
+            if meta.get("spec_accept_length") is not None:
+                output.spec_accept_length = meta["spec_accept_length"]
+            for name in (
+                "spec_verify_ct",
+                "spec_num_correct_drafts",
+                "spec_num_proposed_drafts",
+            ):
+                if name in meta:
+                    value = meta[name]
+                    setattr(output, name, value if _nonnegative_int(value) else None)
+
+            if getattr(args, "cache_report", False):
+                if "cached_tokens" in meta:
+                    output.cached_tokens = meta["cached_tokens"] or 0
+                if "cached_tokens_details" in meta:
+                    output.cached_tokens_details = meta["cached_tokens_details"]
+
+            if data.get("error") is not None:
+                raise ValueError(f"Native response error: {data['error']}")
+            reason = output.finish_reason
+            reason_type = reason.get("type") if isinstance(reason, dict) else reason
+            if reason_type in ("abort", "error"):
+                raise ValueError(f"Native request failed: {reason}")
+
         try:
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.http_status = response.status
                 if response.status == 200:
-                    async for chunk_bytes in response.content:
-                        chunk_bytes = chunk_bytes.strip()
-                        if not chunk_bytes:
-                            continue
+                    if not payload["stream"]:
+                        record_response(await response.json(loads=orjson.loads))
+                    else:
+                        async for chunk_bytes in response.content:
+                            chunk_bytes = chunk_bytes.strip()
+                            if not chunk_bytes or chunk_bytes.startswith(
+                                (b":", b"event:", b"id:", b"retry:")
+                            ):
+                                continue
+                            sse_data = (
+                                chunk_bytes[5:].lstrip()
+                                if chunk_bytes.startswith(b"data:")
+                                else chunk_bytes
+                            )
+                            if sse_data == b"[DONE]":
+                                saw_done = True
+                                break
+                            # Native responses are cumulative; avoid decoding
+                            # their potentially large text to parse JSON twice.
+                            record_response(orjson.loads(sse_data))
 
-                        # Cumulative chunks make parsing O(n^2) per request on this
-                        # single asyncio thread; orjson on raw bytes is ~2.2x cheaper.
-                        sse_data = (
-                            chunk_bytes[6:]
-                            if chunk_bytes.startswith(b"data: ")
-                            else chunk_bytes
+                    if not saw_completion_tokens:
+                        raise ValueError(
+                            "Native response ended without completion_tokens"
                         )
-                        latency = time.perf_counter() - st
-                        if sse_data == b"[DONE]":
-                            pass
-                        else:
-                            data = orjson.loads(sse_data)
-
-                            _meta_info = data.get("meta_info") or {}
-                            if _meta_info.get("spec_accept_length") is not None:
-                                output.spec_accept_length = _meta_info[
-                                    "spec_accept_length"
-                                ]
-
-                            # NOTE: Some completion API might have a last
-                            # usage summary response without a token so we
-                            # want to check a token was generated
-                            _record_server_prompt_len(data, output)
-
-                            if getattr(args, "cache_report", False):
-                                _meta = data.get("meta_info") or {}
-                                output.cached_tokens = _meta.get("cached_tokens", 0)
-                                output.cached_tokens_details = _meta.get(
-                                    "cached_tokens_details"
-                                )
-
-                            if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
-                                generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
-
-                                # First token
-                                if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
-                                    output.ttft = ttft
-
-                                # Decoding phase
-                                else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
-                                    chunk_gap = timestamp - most_recent_timestamp
-                                    adjust_itl = chunk_gap / num_new_tokens
-                                    output.itl.extend([adjust_itl] * num_new_tokens)
-
-                                most_recent_timestamp = timestamp
-                                last_output_len = output_len
-
-                    output.generated_text = generated_text
+                    # A clean HTTP EOF alone does not prove generation finished.
+                    # Accept either native terminal metadata or [DONE], including
+                    # older streams that only carry the latter.
+                    reason = output.finish_reason
+                    reason_type = (
+                        reason.get("type") if isinstance(reason, dict) else reason
+                    )
+                    if (
+                        payload["stream"]
+                        and not saw_done
+                        and reason_type not in ("stop", "length")
+                    ):
+                        raise ValueError(
+                            "Native stream ended without a terminal finish_reason or [DONE]"
+                        )
                     output.success = True
-                    output.latency = latency
-                    output.output_len = output_len
+                    output.latency = time.perf_counter() - st
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -813,6 +928,9 @@ async def async_request_sglang_generate(
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
             print(f"{output.error=}")
+        finally:
+            _record_request_end(output)
+            output.latency = output.end_time - st
 
     if pbar:
         pbar.update(1)
@@ -849,6 +967,7 @@ async def async_request_openai_embeddings(
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
+                output.http_status = response.status
                 if response.status == 200:
                     await response.json()
                     output.latency = time.perf_counter() - st
@@ -863,6 +982,8 @@ async def async_request_openai_embeddings(
             output.success = False
             exc_info = sys.exc_info()
             output.error = "".join(traceback.format_exception(*exc_info))
+        finally:
+            _record_request_end(output)
 
     if pbar:
         pbar.update(1)
@@ -1051,40 +1172,41 @@ class BenchmarkMetrics:
     total_throughput_retokenized: float
 
     # TTFT - Time to First Token (ms)
-    mean_ttft_ms: float
-    median_ttft_ms: float
-    std_ttft_ms: float
-    p90_ttft_ms: float
-    p95_ttft_ms: float
-    p99_ttft_ms: float
+    mean_ttft_ms: float | None
+    median_ttft_ms: float | None
+    std_ttft_ms: float | None
+    p90_ttft_ms: float | None
+    p95_ttft_ms: float | None
+    p99_ttft_ms: float | None
 
     # TPOT - Time per Output Token, excluding the first token (ms)
-    mean_tpot_ms: float
-    median_tpot_ms: float
-    std_tpot_ms: float
-    p90_tpot_ms: float
-    p95_tpot_ms: float
-    p99_tpot_ms: float
+    mean_tpot_ms: float | None
+    median_tpot_ms: float | None
+    std_tpot_ms: float | None
+    p90_tpot_ms: float | None
+    p95_tpot_ms: float | None
+    p99_tpot_ms: float | None
 
     # ITL - Inter-Token Latency (ms)
-    mean_itl_ms: float
-    median_itl_ms: float
-    std_itl_ms: float
-    p90_itl_ms: float
-    p95_itl_ms: float
-    p99_itl_ms: float
-    max_itl_ms: float
+    mean_itl_ms: float | None
+    median_itl_ms: float | None
+    std_itl_ms: float | None
+    p90_itl_ms: float | None
+    p95_itl_ms: float | None
+    p99_itl_ms: float | None
+    max_itl_ms: float | None
 
     # E2E - End-to-End request latency (ms)
-    mean_e2e_latency_ms: float
-    median_e2e_latency_ms: float
-    std_e2e_latency_ms: float
-    p90_e2e_latency_ms: float
-    p95_e2e_latency_ms: float
-    p99_e2e_latency_ms: float
+    mean_e2e_latency_ms: float | None
+    median_e2e_latency_ms: float | None
+    std_e2e_latency_ms: float | None
+    p90_e2e_latency_ms: float | None
+    p95_e2e_latency_ms: float | None
+    p99_e2e_latency_ms: float | None
 
     # Concurrency and peak metrics
     concurrency: float
+    inflight_concurrency: float = 0.0
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
 
@@ -1115,18 +1237,60 @@ async def get_request(
 
             yield request
     else:
-        input_requests_iter = iter(input_requests)
-        for request in input_requests_iter:
+        for index, request in enumerate(input_requests):
             yield request
 
-            if request_rate == float("inf"):
-                # If the request rate is infinity, then we don't need to wait.
+            if request_rate == float("inf") or index == len(input_requests) - 1:
+                # Wait only between requests. A final idle interval is not
+                # part of the workload, even if every response is already done.
                 continue
 
             # Sample the request interval from the exponential distribution.
             interval = np.random.exponential(1.0 / request_rate)
             # The next request will be sent after the interval.
             await asyncio.sleep(interval)
+
+
+def _inflight_timeline(outputs: list[RequestFuncOutput]):
+    """Exact half-open request intervals, including measured failed requests."""
+    events: dict[float, int] = {}
+    total_request_time = 0.0
+    for output in outputs:
+        start = output.start_time
+        end = output.end_time if output.end_time is not None else start + output.latency
+        if not math.isfinite(start) or not math.isfinite(end) or end <= start:
+            continue
+        events[start] = events.get(start, 0) + 1
+        events[end] = events.get(end, 0) - 1
+        total_request_time += end - start
+    active = peak = 0
+    timestamps, counts = [], []
+    for timestamp, change in sorted(events.items()):
+        # Coalescing simultaneous starts/ends respects [start, end), so a new
+        # request replacing one that ended does not create a false peak.
+        active += change
+        peak = max(peak, active)
+        timestamps.append(timestamp)
+        counts.append(active)
+    return peak, total_request_time, timestamps, counts
+
+
+def _latency_statistics(name: str, values: list[float]) -> dict[str, float | None]:
+    """Undefined latency statistics are null, not NaN or fabricated zeroes."""
+    statistics = {
+        "mean": np.mean,
+        "median": np.median,
+        "std": np.std,
+        "p90": lambda x: np.percentile(x, 90),
+        "p95": lambda x: np.percentile(x, 95),
+        "p99": lambda x: np.percentile(x, 99),
+    }
+    if name == "itl":
+        statistics["max"] = np.max
+    return {
+        f"{key}_{name}_ms": float(stat(values) * 1000) if values else None
+        for key, stat in statistics.items()
+    }
 
 
 def calculate_metrics(
@@ -1181,7 +1345,8 @@ def calculate_metrics(
                     retokenized_itls.extend([adjusted_itl] * num_tokens)
             else:
                 itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
+            if output_len > 0:
+                ttfts.append(outputs[i].ttft)
 
             e2e_latencies.append(outputs[i].latency)
 
@@ -1198,7 +1363,9 @@ def calculate_metrics(
         )
 
     max_output_tokens_per_s = 0.0
-    max_concurrent_requests = 0
+    max_concurrent_requests, inflight_time, inflight_times, inflight_counts = (
+        _inflight_timeline(outputs)
+    )
 
     successful_outputs = [output for output in outputs if output.success]
     if successful_outputs:
@@ -1209,10 +1376,9 @@ def calculate_metrics(
 
         duration_seconds = int(np.ceil(max_end_time - min_start_time)) + 1
         tokens_per_second = np.zeros(duration_seconds)
-        concurrent_requests_per_second = np.zeros(duration_seconds)
 
         for output in outputs:
-            if not output.success:
+            if not output.success or output.output_len == 0:
                 continue
 
             token_times = [output.start_time + output.ttft]
@@ -1226,19 +1392,8 @@ def calculate_metrics(
                 if 0 <= second_bucket < duration_seconds:
                     tokens_per_second[second_bucket] += 1
 
-            request_start_second = int(output.start_time - min_start_time)
-            request_end_second = int(
-                (output.start_time + output.latency) - min_start_time
-            )
-
-            for second in range(
-                request_start_second, min(request_end_second + 1, duration_seconds)
-            ):
-                concurrent_requests_per_second[second] += 1
-
         if len(tokens_per_second) > 0:
             max_output_tokens_per_s = float(np.max(tokens_per_second))
-            max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
         if plot_throughput:
             if TERM_PLOTLIB_AVAILABLE:
@@ -1252,9 +1407,9 @@ def calculate_metrics(
                     xlabel="Time (s)",
                 )
                 fig.plot(
-                    np.arange(len(concurrent_requests_per_second)),
-                    concurrent_requests_per_second,
-                    title="Concurrent requests per second",
+                    [timestamp - min_start_time for timestamp in inflight_times],
+                    inflight_counts,
+                    title="In-flight requests (including failures)",
                     xlabel="Time (s)",
                 )
                 fig.show()
@@ -1276,38 +1431,42 @@ def calculate_metrics(
         total_throughput=(total_input + sum(output_lens)) / dur_s,
         total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
         / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0)
-        * 1000,  # ttfts is empty if streaming is not supported by backend
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        p90_ttft_ms=np.percentile(ttfts or 0, 90) * 1000,
-        p95_ttft_ms=np.percentile(ttfts or 0, 95) * 1000,
-        p99_ttft_ms=np.percentile(ttfts or 0, 99) * 1000,
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        p90_tpot_ms=np.percentile(tpots or 0, 90) * 1000,
-        p95_tpot_ms=np.percentile(tpots or 0, 95) * 1000,
-        p99_tpot_ms=np.percentile(tpots or 0, 99) * 1000,
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        p90_itl_ms=np.percentile(itls or 0, 90) * 1000,
-        p95_itl_ms=np.percentile(itls or 0, 95) * 1000,
-        p99_itl_ms=np.percentile(itls or 0, 99) * 1000,
-        max_itl_ms=np.max(itls or 0) * 1000,
-        mean_e2e_latency_ms=np.mean(e2e_latencies) * 1000,
-        median_e2e_latency_ms=np.median(e2e_latencies) * 1000,
-        std_e2e_latency_ms=np.std(e2e_latencies) * 1000,
-        p90_e2e_latency_ms=np.percentile(e2e_latencies, 90) * 1000,
-        p95_e2e_latency_ms=np.percentile(e2e_latencies, 95) * 1000,
-        p99_e2e_latency_ms=np.percentile(e2e_latencies, 99) * 1000,
+        **_latency_statistics("ttft", ttfts),
+        **_latency_statistics("tpot", tpots),
+        **_latency_statistics("itl", itls),
+        **_latency_statistics("e2e_latency", e2e_latencies),
         concurrency=np.sum(e2e_latencies) / dur_s,
+        inflight_concurrency=inflight_time / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
         max_concurrent_requests=max_concurrent_requests,
     )
 
     return metrics, output_lens
+
+
+def _print_latency_group(metrics, title, field, label):
+    print("{s:{c}^{n}}".format(s=title, c="-", n=50))
+    statistics = ("mean", "median", "p90", "p95", "p99")
+    if field == "itl":
+        statistics += ("max",)
+    for stat in statistics:
+        value = getattr(metrics, f"{stat}_{field}_ms")
+        formatted = "N/A" if value is None else f"{value:.2f}"
+        print(f"{stat.capitalize() + ' ' + label + ' (ms):':<40} {formatted:<10}")
+
+
+def _get_benchmark_server_info(base_url: str):
+    """Best-effort metadata must not prevent writing measured request failures."""
+    try:
+        response = requests.get(
+            base_url + "/server_info", headers=get_auth_headers(), timeout=10
+        )
+        if response.status_code == 200:
+            info = response.json()
+            return info if isinstance(info, dict) else None
+    except (requests.RequestException, ValueError) as exc:
+        warnings.warn(f"Could not collect benchmark server_info: {exc}", stacklevel=2)
+    return None
 
 
 MULTI_TURN_BACKENDS = {"sglang-oai-chat", "vllm-chat", "lmdeploy-chat"}
@@ -1617,6 +1776,10 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+    # Freeze the workload clock before profiler flushing and control-plane
+    # metadata requests. Neither contributes output tokens to this interval.
+    benchmark_end_time = time.perf_counter()
+    benchmark_duration = benchmark_end_time - benchmark_start_time
     if is_multi_turn:
         outputs = [x for output in outputs for x in output]
 
@@ -1639,30 +1802,42 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
-    if "sglang" in backend:
-        server_info = requests.get(
-            base_url + "/server_info", headers=get_auth_headers()
-        )
-        if server_info.status_code == 200:
-            server_info_json = server_info.json()
-            if "decode" in server_info_json:
-                server_info_json = server_info_json["decode"][0]
-            if (
-                "internal_states" in server_info_json
-                and server_info_json["internal_states"]
-            ):
-                accept_length = server_info_json["internal_states"][0].get(
-                    "avg_spec_accept_length", None
-                )
-            else:
-                accept_length = None
+    metadata_start_time = time.perf_counter()
+    server_info = _get_benchmark_server_info(base_url)
+    metadata_duration = time.perf_counter() - metadata_start_time
+    # Preserve the legacy field for older consumers, but label its limited
+    # scope. It is not a delta or an all-rank acceptance ratio for this run.
+    accept_length = None
+    accept_length_source = None
+    if "sglang" in backend and server_info is not None:
+        server_info_json = server_info
+        if "decode" in server_info_json:
+            decode_workers = server_info_json.get("decode") or []
+            server_info_json = (
+                decode_workers[0]
+                if isinstance(decode_workers, list)
+                and decode_workers
+                and isinstance(decode_workers[0], dict)
+                else {}
+            )
+            source = "first_decode_worker_first_rank_lifetime"
         else:
-            accept_length = None
-    else:
-        accept_length = None
+            source = "first_rank_lifetime"
+        states = server_info_json.get("internal_states") or []
+        if isinstance(states, list) and states and isinstance(states[0], dict):
+            value = states[0].get("avg_spec_accept_length")
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
+                accept_length = value
+                accept_length_source = source
+
+    request_speculative_metrics = _request_speculative_metrics(outputs)
 
     # Compute metrics and print results
-    benchmark_duration = time.perf_counter() - benchmark_start_time
     metrics, output_lens = calculate_metrics(
         input_requests=None if is_multi_turn else benchmark_requests,
         outputs=outputs,
@@ -1692,6 +1867,7 @@ async def benchmark(
         )
     )
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10}".format("Failed requests:", len(outputs) - metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
@@ -1744,52 +1920,33 @@ async def benchmark(
             )
         )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if accept_length:
-        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
-    if goodput:
-        print_goodput(goodput)
-    print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
-    print(
-        "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
-    )
     print(
         "{:<40} {:<10.2f}".format(
-            "Median E2E Latency (ms):", metrics.median_e2e_latency_ms
+            "In-flight concurrency (all requests):", metrics.inflight_concurrency
         )
     )
-    print(
-        "{:<40} {:<10.2f}".format("P90 E2E Latency (ms):", metrics.p90_e2e_latency_ms)
-    )
-    print(
-        "{:<40} {:<10.2f}".format("P95 E2E Latency (ms):", metrics.p95_e2e_latency_ms)
-    )
-    print(
-        "{:<40} {:<10.2f}".format("P99 E2E Latency (ms):", metrics.p99_e2e_latency_ms)
-    )
-    if not is_embedding:
-        print("{s:{c}^{n}}".format(s="Time to First Token", n=50, c="-"))
-        print("{:<40} {:<10.2f}".format("Mean TTFT (ms):", metrics.mean_ttft_ms))
-        print("{:<40} {:<10.2f}".format("Median TTFT (ms):", metrics.median_ttft_ms))
-        print("{:<40} {:<10.2f}".format("P90 TTFT (ms):", metrics.p90_ttft_ms))
-        print("{:<40} {:<10.2f}".format("P95 TTFT (ms):", metrics.p95_ttft_ms))
-        print("{:<40} {:<10.2f}".format("P99 TTFT (ms):", metrics.p99_ttft_ms))
+    if accept_length:
         print(
-            "{s:{c}^{n}}".format(
-                s="Time per Output Token (excl. 1st token)", n=50, c="-"
+            "{:<40} {:<10.2f}".format(
+                "Accept length (first rank, lifetime):", accept_length
             )
         )
-        print("{:<40} {:<10.2f}".format("Mean TPOT (ms):", metrics.mean_tpot_ms))
-        print("{:<40} {:<10.2f}".format("Median TPOT (ms):", metrics.median_tpot_ms))
-        print("{:<40} {:<10.2f}".format("P90 TPOT (ms):", metrics.p90_tpot_ms))
-        print("{:<40} {:<10.2f}".format("P95 TPOT (ms):", metrics.p95_tpot_ms))
-        print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
-        print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
-        print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
-        print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
-        print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
-        print("{:<40} {:<10.2f}".format("P95 ITL (ms):", metrics.p95_itl_ms))
-        print("{:<40} {:<10.2f}".format("P99 ITL (ms):", metrics.p99_itl_ms))
-        print("{:<40} {:<10.2f}".format("Max ITL (ms):", metrics.max_itl_ms))
+    if request_speculative_metrics["accept_length"] is not None:
+        print(
+            "{:<40} {:<10.2f}".format(
+                "Accept length (measured requests):",
+                request_speculative_metrics["accept_length"],
+            )
+        )
+    if goodput:
+        print_goodput(goodput)
+    _print_latency_group(metrics, "End-to-End Latency", "e2e_latency", "E2E Latency")
+    if not is_embedding:
+        _print_latency_group(metrics, "Time to First Token", "ttft", "TTFT")
+        _print_latency_group(
+            metrics, "Time per Output Token (excl. 1st token)", "tpot", "TPOT"
+        )
+        _print_latency_group(metrics, "Inter-Token Latency", "itl", "ITL")
     if args.cache_report:
         total_prompt_tokens = 0
         total_cached = 0
@@ -1844,85 +2001,100 @@ async def benchmark(
                 print("{:<40} {:.1f}%".format(label, storage_pct))
     print("=" * 50)
 
-    resp = requests.get(base_url + "/server_info", headers=get_auth_headers())
-    server_info = resp.json() if resp.status_code == 200 else None
+    result = {
+        # Arguments
+        "tag": getattr(args, "tag", None),
+        "backend": args.backend,
+        "dataset_name": args.dataset_name,
+        "request_rate": (
+            "trace"
+            if use_trace_timestamps
+            else "inf"
+            if math.isinf(request_rate)
+            else request_rate
+        ),
+        "max_concurrency": max_concurrency,
+        "sharegpt_output_len": args.sharegpt_output_len,
+        "random_input_len": args.random_input_len,
+        "random_output_len": args.random_output_len,
+        "random_range_ratio": args.random_range_ratio,
+        # Information
+        "measurement_schema_version": 2,
+        "server_info": server_info,
+        # Results
+        "duration": benchmark_duration,
+        "workload_duration": benchmark_duration,
+        "workload_start_time": benchmark_start_time,
+        "workload_end_time": benchmark_end_time,
+        "time_basis": "perf_counter_seconds",
+        "metadata_collection_duration": metadata_duration,
+        "offered_requests": len(outputs),
+        "completed": metrics.completed,
+        "failed_requests": len(outputs) - metrics.completed,
+        "error_counts": dict(
+            Counter(output.error for output in outputs if not output.success)
+        ),
+        "http_status_counts": dict(
+            Counter(
+                str(output.http_status) if output.http_status is not None else "unknown"
+                for output in outputs
+            )
+        ),
+        "total_input_tokens": metrics.total_input,
+        "total_input_text_tokens": metrics.total_input_text,
+        "total_input_vision_tokens": metrics.total_input_vision,
+        "total_output_tokens": metrics.total_output,
+        "total_output_tokens_retokenized": metrics.total_output_retokenized,
+        "request_throughput": metrics.request_throughput,
+        "input_throughput": metrics.input_throughput,
+        "output_throughput": metrics.output_throughput,
+        "total_throughput": metrics.total_throughput,
+        "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
+        "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
+        "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
+        "p90_e2e_latency_ms": metrics.p90_e2e_latency_ms,
+        "p95_e2e_latency_ms": metrics.p95_e2e_latency_ms,
+        "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
+        "mean_ttft_ms": metrics.mean_ttft_ms,
+        "median_ttft_ms": metrics.median_ttft_ms,
+        "std_ttft_ms": metrics.std_ttft_ms,
+        "p90_ttft_ms": metrics.p90_ttft_ms,
+        "p95_ttft_ms": metrics.p95_ttft_ms,
+        "p99_ttft_ms": metrics.p99_ttft_ms,
+        "mean_tpot_ms": metrics.mean_tpot_ms,
+        "median_tpot_ms": metrics.median_tpot_ms,
+        "std_tpot_ms": metrics.std_tpot_ms,
+        "p90_tpot_ms": metrics.p90_tpot_ms,
+        "p95_tpot_ms": metrics.p95_tpot_ms,
+        "p99_tpot_ms": metrics.p99_tpot_ms,
+        "mean_itl_ms": metrics.mean_itl_ms,
+        "median_itl_ms": metrics.median_itl_ms,
+        "std_itl_ms": metrics.std_itl_ms,
+        "p90_itl_ms": metrics.p90_itl_ms,
+        "p95_itl_ms": metrics.p95_itl_ms,
+        "p99_itl_ms": metrics.p99_itl_ms,
+        "concurrency": metrics.concurrency,
+        "inflight_concurrency": metrics.inflight_concurrency,
+        "accept_length": accept_length,
+        "accept_length_source": accept_length_source,
+        "request_speculative_metrics": request_speculative_metrics,
+        "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+        "max_concurrent_requests": metrics.max_concurrent_requests,
+    }
 
-    if (
-        metrics.median_ttft_ms is not None
-        and metrics.mean_itl_ms is not None
-        and metrics.output_throughput is not None
-    ):
-        result = {
-            # Arguments
-            "tag": getattr(args, "tag", None),
-            "backend": args.backend,
-            "dataset_name": args.dataset_name,
-            "request_rate": "trace" if use_trace_timestamps else request_rate,
-            "max_concurrency": max_concurrency,
-            "sharegpt_output_len": args.sharegpt_output_len,
-            "random_input_len": args.random_input_len,
-            "random_output_len": args.random_output_len,
-            "random_range_ratio": args.random_range_ratio,
-            # Information
-            "server_info": server_info,
-            # Results
-            "duration": benchmark_duration,
-            "completed": metrics.completed,
-            "total_input_tokens": metrics.total_input,
-            "total_input_text_tokens": metrics.total_input_text,
-            "total_input_vision_tokens": metrics.total_input_vision,
-            "total_output_tokens": metrics.total_output,
-            "total_output_tokens_retokenized": metrics.total_output_retokenized,
-            "request_throughput": metrics.request_throughput,
-            "input_throughput": metrics.input_throughput,
-            "output_throughput": metrics.output_throughput,
-            "total_throughput": metrics.total_throughput,
-            "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-            "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
-            "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
-            "p90_e2e_latency_ms": metrics.p90_e2e_latency_ms,
-            "p95_e2e_latency_ms": metrics.p95_e2e_latency_ms,
-            "p99_e2e_latency_ms": metrics.p99_e2e_latency_ms,
-            "mean_ttft_ms": metrics.mean_ttft_ms,
-            "median_ttft_ms": metrics.median_ttft_ms,
-            "std_ttft_ms": metrics.std_ttft_ms,
-            "p90_ttft_ms": metrics.p90_ttft_ms,
-            "p95_ttft_ms": metrics.p95_ttft_ms,
-            "p99_ttft_ms": metrics.p99_ttft_ms,
-            "mean_tpot_ms": metrics.mean_tpot_ms,
-            "median_tpot_ms": metrics.median_tpot_ms,
-            "std_tpot_ms": metrics.std_tpot_ms,
-            "p90_tpot_ms": metrics.p90_tpot_ms,
-            "p95_tpot_ms": metrics.p95_tpot_ms,
-            "p99_tpot_ms": metrics.p99_tpot_ms,
-            "mean_itl_ms": metrics.mean_itl_ms,
-            "median_itl_ms": metrics.median_itl_ms,
-            "std_itl_ms": metrics.std_itl_ms,
-            "p90_itl_ms": metrics.p90_itl_ms,
-            "p95_itl_ms": metrics.p95_itl_ms,
-            "p99_itl_ms": metrics.p99_itl_ms,
-            "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
-            "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
-            "max_concurrent_requests": metrics.max_concurrent_requests,
+    if goodput:
+        result.update(msgspec.structs.asdict(goodput))
+
+    if args.cache_report:
+        result["cache_report"] = {
+            "total_prompt_tokens": total_prompt_tokens,
+            "total_cached_tokens": total_cached,
+            "cache_hit_rate_pct": round(hit_rate, 2),
+            "device_cached_tokens": total_device if has_details else None,
+            "host_cached_tokens": total_host if has_details else None,
+            "storage_cached_tokens": (total_storage if total_storage > 0 else None),
+            "storage_backend": storage_backend_name,
         }
-
-        if goodput:
-            result.update(msgspec.structs.asdict(goodput))
-
-        if args.cache_report:
-            result["cache_report"] = {
-                "total_prompt_tokens": total_prompt_tokens,
-                "total_cached_tokens": total_cached,
-                "cache_hit_rate_pct": round(hit_rate, 2),
-                "device_cached_tokens": total_device if has_details else None,
-                "host_cached_tokens": total_host if has_details else None,
-                "storage_cached_tokens": (total_storage if total_storage > 0 else None),
-                "storage_backend": storage_backend_name,
-            }
-    else:
-        print(f"Error running benchmark for request rate: {request_rate}")
-        print("-" * 30)
 
     # Determine output file name
     if args.output_file:
@@ -1949,6 +2121,31 @@ async def benchmark(
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        # All times are monotonic seconds on the benchmark client. Completion
+        # counts are null when a backend never reported them; output_lens above
+        # retains the existing successful-token-only accounting for compatibility.
+        "request_details": [
+            {
+                "request_index": index,
+                "success": output.success,
+                "http_status": output.http_status,
+                "finish_reason": output.finish_reason,
+                "error": output.error,
+                "start_time": output.start_time,
+                "end_time": output.end_time,
+                "latency": output.latency,
+                "ttft": output.ttft,
+                "prompt_tokens": output.prompt_len,
+                "completion_tokens": output.completion_tokens,
+                "cached_tokens": output.cached_tokens,
+                "cache_details": output.cached_tokens_details,
+                "spec_accept_length": output.spec_accept_length,
+                "spec_verify_ct": output.spec_verify_ct,
+                "spec_num_correct_drafts": output.spec_num_correct_drafts,
+                "spec_num_proposed_drafts": output.spec_num_proposed_drafts,
+            }
+            for index, output in enumerate(outputs)
+        ],
     }
 
     if args.cache_report:
@@ -2068,6 +2265,8 @@ def run_benchmark(args_: argparse.Namespace):
 
     # Inject bootstrap fields for fake decode benchmarking
     if getattr(args, "fake_prefill", False):
+        from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+
         extra_request_body["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
         extra_request_body["bootstrap_room"] = 0
 
