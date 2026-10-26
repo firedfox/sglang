@@ -119,3 +119,85 @@ class PrefetchCostModel:
             recompute_seconds=recompute,
             should_cancel=remaining_read > threshold,
         )
+
+    def describe_estimate(
+        self,
+        estimate: Optional[PrefetchCostEstimate],
+        *,
+        remaining_tokens: int,
+        recompute_tokens: int,
+        observed_tokens: int,
+        observation_seconds: float,
+    ) -> dict[str, object]:
+        """Explain an existing estimate without evaluating the policy again.
+
+        The caller supplies the same sample used for ``estimate``. Diagnostics
+        must not read another clock or turn an unavailable estimate into a
+        keep decision. No request identifiers become metric labels.
+        """
+        if estimate is not None:
+            reason = (
+                "read_exceeds_recompute_margin"
+                if estimate.should_cancel
+                else "read_within_recompute_margin"
+            )
+        elif remaining_tokens <= 0 or recompute_tokens <= 0:
+            reason = "no_remaining_work"
+        elif observed_tokens < 0:
+            reason = "invalid_progress"
+        elif not self._finite_number(observation_seconds):
+            reason = "invalid_observation"
+        elif observation_seconds < self.min_observation_seconds:
+            reason = "observation_too_short"
+        elif self.read_tokens_per_second is None and not (
+            observed_tokens > 0 and observation_seconds > 0
+        ):
+            reason = "no_read_rate"
+        else:
+            reason = "nonfinite_estimate"
+
+        rate_source = "unavailable"
+        read_rate = None
+        if estimate is not None:
+            if observed_tokens > 0 and observation_seconds > 0:
+                rate_source = "observed"
+                read_rate = observed_tokens / observation_seconds
+            else:
+                rate_source = "configured"
+                read_rate = self.read_tokens_per_second
+        return {
+            "decision": (
+                "timeout_fallback"
+                if estimate is None
+                else "cancel"
+                if estimate.should_cancel
+                else "keep"
+            ),
+            "reason": reason,
+            "remaining_tokens": remaining_tokens,
+            "recompute_tokens": recompute_tokens,
+            "observed_tokens": observed_tokens,
+            "observation_seconds": (
+                observation_seconds
+                if self._finite_number(observation_seconds)
+                else None
+            ),
+            "min_observation_seconds": self.min_observation_seconds,
+            "read_rate_source": rate_source,
+            "read_tokens_per_second": read_rate,
+            "configured_read_tokens_per_second": self.read_tokens_per_second,
+            "recompute_tokens_per_second": self.recompute_tokens_per_second,
+            "cancel_margin": self.cancel_margin,
+            "recompute_fixed_seconds": self.recompute_fixed_seconds,
+            "remaining_read_seconds": (
+                estimate.remaining_read_seconds if estimate is not None else None
+            ),
+            "recompute_seconds": (
+                estimate.recompute_seconds if estimate is not None else None
+            ),
+            "cancel_threshold_seconds": (
+                self.cancel_margin * estimate.recompute_seconds
+                if estimate is not None
+                else None
+            ),
+        }

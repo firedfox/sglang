@@ -3,6 +3,7 @@
 
 import json
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.mem_cache.prefetch_cost import PrefetchCostModel
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -173,6 +174,71 @@ class TestPrefetchCostModel(unittest.TestCase):
             '"min_observation_seconds":0,"recompute_fixed_seconds":0,"cancel_margin":1}'
         )
         self.assertTrue(self.estimate(model, observation_seconds=0).should_cancel)
+
+    def test_diagnostic_explains_the_existing_sample_without_reevaluation(self):
+        model = PrefetchCostModel(
+            recompute_tokens_per_second=47000,
+            read_tokens_per_second=34000,
+        )
+        sample = dict(
+            remaining_tokens=131072,
+            recompute_tokens=131072,
+            observed_tokens=50000,
+            observation_seconds=1.0,
+        )
+        estimate = model.estimate(**sample)
+        with patch.object(
+            PrefetchCostModel, "estimate", side_effect=AssertionError("evaluate once")
+        ):
+            diagnostic = model.describe_estimate(estimate, **sample)
+        self.assertEqual(diagnostic["decision"], "keep")
+        self.assertEqual(diagnostic["read_rate_source"], "observed")
+        self.assertEqual(diagnostic["read_tokens_per_second"], 50000)
+        self.assertEqual(diagnostic["configured_read_tokens_per_second"], 34000)
+        self.assertEqual(diagnostic["remaining_read_seconds"], 131072 / 50000)
+        self.assertEqual(diagnostic["recompute_seconds"], 131072 / 47000)
+        self.assertEqual(diagnostic["cancel_threshold_seconds"], 1.2 * 131072 / 47000)
+
+    def test_diagnostic_distinguishes_configured_cancel_from_timeout_fallback(self):
+        model = PrefetchCostModel(
+            recompute_tokens_per_second=47000,
+            read_tokens_per_second=34000,
+        )
+        sample = dict(
+            remaining_tokens=131072,
+            recompute_tokens=131072,
+            observed_tokens=0,
+            observation_seconds=1.0,
+        )
+        diagnostic = model.describe_estimate(model.estimate(**sample), **sample)
+        self.assertEqual(diagnostic["decision"], "cancel")
+        self.assertEqual(diagnostic["read_rate_source"], "configured")
+        for value, reason in (
+            (0.049, "observation_too_short"),
+            (float("nan"), "invalid_observation"),
+        ):
+            with self.subTest(value=value):
+                sample["observation_seconds"] = value
+                diagnostic = model.describe_estimate(model.estimate(**sample), **sample)
+                self.assertEqual(diagnostic["decision"], "timeout_fallback")
+                self.assertEqual(diagnostic["reason"], reason)
+                self.assertEqual(diagnostic["read_rate_source"], "unavailable")
+                self.assertIsNone(diagnostic["remaining_read_seconds"])
+                json.dumps(diagnostic, allow_nan=False)
+
+    def test_no_read_rate_diagnostic_handles_zero_elapsed_positive_progress(self):
+        model = PrefetchCostModel(
+            recompute_tokens_per_second=1000, min_observation_seconds=0
+        )
+        sample = dict(
+            remaining_tokens=100,
+            recompute_tokens=100,
+            observed_tokens=2,
+            observation_seconds=0,
+        )
+        diagnostic = model.describe_estimate(model.estimate(**sample), **sample)
+        self.assertEqual(diagnostic["reason"], "no_read_rate")
+        self.assertEqual(diagnostic["decision"], "timeout_fallback")
 
 
 if __name__ == "__main__":

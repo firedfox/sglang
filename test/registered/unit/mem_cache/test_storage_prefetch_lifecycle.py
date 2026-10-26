@@ -1,5 +1,7 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
+import json
+import logging
 import tempfile
 import unittest
 from array import array
@@ -560,6 +562,124 @@ class TestStoragePrefetchCostAware(unittest.TestCase):
                 args=(f"{tmpdir}/gloo",),
                 nprocs=2,
             )
+
+
+class TestStoragePrefetchCostDiagnostics(unittest.TestCase):
+    logger_name = "sglang.srt.mem_cache.unified_radix_cache"
+    marker = "HiCache prefetch cost decision "
+
+    def decisions(self, captured):
+        return [
+            json.loads(record.getMessage().split(self.marker, 1)[1])
+            for record in captured.records
+            if self.marker in record.getMessage()
+        ]
+
+    def test_stop_drain_logs_one_terminal_snapshot_with_original_vote(self):
+        cache, operation = _cost_fixture()
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            with patch("time.perf_counter", return_value=100.0):
+                self.assertFalse(cache.check_prefetch_progress(_REQ))
+            operation.completed_tokens = 2
+            with patch("time.perf_counter", return_value=100.5):
+                self.assertTrue(cache._can_terminate_prefetch(operation))
+                cache._mark_prefetch_deadline_expired(operation)
+            with patch("time.perf_counter", return_value=110.0):
+                self.assertTrue(cache._can_terminate_prefetch(operation))
+                cache._mark_prefetch_deadline_expired(operation)
+                self.assertTrue(cache.check_prefetch_progress(_REQ))
+                self.assertTrue(cache.check_prefetch_progress(_REQ))
+        decisions = self.decisions(captured)
+        self.assertEqual(len(decisions), 1)
+        decision = decisions[0]
+        self.assertEqual(decision["terminal"], "buffer_stage")
+        self.assertEqual(decision["local_vote"], "cost_aware")
+        self.assertEqual(decision["agreed_stop_reason"], "cost_aware")
+        self.assertIsNone(decision["fallback_reason"])
+        self.assertEqual(decision["last_evaluation"]["read_rate_source"], "observed")
+        self.assertEqual(decision["last_evaluation"]["read_tokens_per_second"], 4)
+        self.assertEqual(decision["last_evaluation"]["remaining_tokens"], 6)
+        self.assertEqual(decision["last_evaluation"]["recompute_tokens"], 6)
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+        self.assertEqual(cache._prefetch_cost_diagnostics, {})
+
+    def test_peer_stop_does_not_relabel_the_local_keep_vote(self):
+        cache, operation = _cost_fixture()
+        cache._all_reduce = Mock(side_effect=lambda tensor, op: tensor.fill_(1))
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["local_vote"], "keep_waiting")
+        self.assertEqual(decision["agreed_stop_reason"], "cost_aware")
+        self.assertEqual(decision["fallback_reason"], "wait_not_started")
+        self.assertIsNone(decision["last_evaluation"])
+        # Observability must not introduce another rank collective.
+        cache._all_reduce.assert_called_once()
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+
+    def test_completed_before_first_poll_is_not_reported_as_a_cost_keep(self):
+        cache, operation = _cost_fixture()
+        operation.completed_tokens = 8
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            cache._handle_prefetch_result(operation)
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["last_poll_reason"], "not_evaluated")
+        self.assertEqual(decision["fallback_reason"], "not_evaluated")
+        self.assertIsNone(decision["last_evaluation"])
+        self.assertIsNone(decision["agreed_stop_reason"])
+
+    def test_deadline_retains_the_reason_cost_estimation_was_unavailable(self):
+        cache, operation = _cost_fixture()
+        operation.hash_value = []
+        operation.host_indices = None
+        cache.ongoing_prefetch[_REQ] = cache.ongoing_prefetch[_REQ]._replace(
+            host_indices=None
+        )
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            for now in (100.0, 100.5):
+                with patch("time.perf_counter", return_value=now):
+                    self.assertFalse(cache.check_prefetch_progress(_REQ))
+            with patch("time.perf_counter", return_value=103.0):
+                self.assertTrue(cache.check_prefetch_progress(_REQ))
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["agreed_stop_reason"], "deadline")
+        self.assertEqual(decision["fallback_reason"], "query_pending")
+        self.assertEqual(decision["unfulfilled_reason"], "deadline")
+        self.assertEqual(cache._prefetch_cost_diagnostics, {})
+
+    def test_abort_logs_last_keep_once_and_releases_diagnostic_state(self):
+        cache, operation = _cost_fixture()
+        cache.prefetch_cost_model = PrefetchCostModel(
+            recompute_tokens_per_second=1, read_tokens_per_second=1
+        )
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            with patch("time.perf_counter", return_value=100.0):
+                self.assertFalse(cache.check_prefetch_progress(_REQ))
+            operation.completed_tokens = 2
+            with patch("time.perf_counter", return_value=100.5):
+                self.assertFalse(cache.check_prefetch_progress(_REQ))
+            cache.release_aborted_request(_REQ)
+            cache.release_aborted_request(_REQ)
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["terminal"], "retired")
+        self.assertEqual(decision["unfulfilled_reason"], "request_aborted")
+        self.assertEqual(decision["last_evaluation"]["decision"], "keep")
+        self.assertEqual(cache._prefetch_cost_diagnostics, {})
+
+    def test_default_log_level_does_not_build_diagnostics(self):
+        cache, operation = _cost_fixture()
+        log = logging.getLogger(self.logger_name)
+        with (
+            patch.object(log, "isEnabledFor", return_value=False),
+            patch.object(PrefetchCostModel, "describe_estimate") as describe,
+        ):
+            with patch("time.perf_counter", return_value=100.0):
+                cache.check_prefetch_progress(_REQ)
+            with patch("time.perf_counter", return_value=100.5):
+                cache.check_prefetch_progress(_REQ)
+        describe.assert_not_called()
+        self.assertFalse(getattr(cache, "_prefetch_cost_diagnostics", {}))
 
 
 def _two_rank_retry_trace(rank, rendezvous):

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import threading
 import time
 from array import array
-from dataclasses import replace
+from dataclasses import asdict, replace
 from http import HTTPStatus
 from queue import Queue
 from typing import (
@@ -441,6 +442,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
+        # Debug-only snapshots live for one IO attempt, unlike the request's
+        # sticky wait budget. Every removal from ongoing_prefetch drains them.
+        self._prefetch_cost_diagnostics: dict[int, dict] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -2298,6 +2302,7 @@ class UnifiedRadixCache(BasePrefixCache):
         model = self.prefetch_cost_model
         wait = self._storage_prefetch_wait.get(operation.handle)
         expected_tokens = len(operation.hash_value) * self.page_size
+        diagnostic = self._prefetch_cost_diagnostic_state(operation)
         if (
             model is None
             or wait is None
@@ -2307,6 +2312,17 @@ class UnifiedRadixCache(BasePrefixCache):
             # Unknown query results have no reliable remaining read size. When
             # KV has already landed, only sidecars remain and cancellation would
             # discard useful work without an estimate for those separate pools.
+            if diagnostic is not None:
+                diagnostic["last_poll_reason"] = (
+                    "missing_model"
+                    if model is None
+                    else "wait_not_started"
+                    if wait is None
+                    else "query_pending"
+                    if operation.host_indices is None
+                    else "kv_complete_waiting_sidecars"
+                )
+                diagnostic["fallback_reason"] = diagnostic["last_poll_reason"]
             return False
 
         self._observe_prefetch_progress(operation, wait)
@@ -2326,13 +2342,103 @@ class UnifiedRadixCache(BasePrefixCache):
                 expected_tokens,
                 len(operation.sidecar_hash_values or ()) * self.page_size,
             )
+        observed_tokens = operation.completed_tokens - wait.progress_start_tokens
+        observation_seconds = wait.progress_timer.elapsed()
         estimate = model.estimate(
             remaining_tokens=remaining_tokens,
             recompute_tokens=recompute_tokens,
-            observed_tokens=operation.completed_tokens - wait.progress_start_tokens,
-            observation_seconds=wait.progress_timer.elapsed(),
+            observed_tokens=observed_tokens,
+            observation_seconds=observation_seconds,
         )
+        if diagnostic is not None:
+            diagnostic["last_evaluation"] = model.describe_estimate(
+                estimate,
+                remaining_tokens=remaining_tokens,
+                recompute_tokens=recompute_tokens,
+                observed_tokens=observed_tokens,
+                observation_seconds=observation_seconds,
+            )
+            diagnostic["last_poll_reason"] = diagnostic["last_evaluation"]["reason"]
+            diagnostic["fallback_reason"] = (
+                diagnostic["last_poll_reason"] if estimate is None else None
+            )
         return estimate is not None and estimate.should_cancel
+
+    def _prefetch_cost_diagnostic_state(
+        self, operation: PrefetchOperation
+    ) -> Optional[dict]:
+        if getattr(
+            self, "prefetch_stop_policy", None
+        ) != "cost_aware" or not logger.isEnabledFor(logging.DEBUG):
+            return None
+        diagnostics = getattr(self, "_prefetch_cost_diagnostics", None)
+        if diagnostics is None:
+            diagnostics = self._prefetch_cost_diagnostics = {}
+        return diagnostics.setdefault(operation.id, {})
+
+    def _note_prefetch_terminal_reason(
+        self, request: CacheRequestHandle, reason: Optional[str]
+    ) -> None:
+        if getattr(
+            self, "prefetch_stop_policy", None
+        ) != "cost_aware" or not logger.isEnabledFor(logging.DEBUG):
+            return
+        info = self.ongoing_prefetch.get(request)
+        if info is not None and reason is not None:
+            diagnostic = self._prefetch_cost_diagnostic_state(info.operation)
+            if diagnostic is not None:
+                # A subsequent generic revoke must not hide the original cause.
+                diagnostic.setdefault("unfulfilled_reason", reason)
+
+    def _log_prefetch_cost_decision(
+        self, operation: PrefetchOperation, *, terminal: str
+    ) -> None:
+        """Consume one attempt's diagnostic at its existing terminal boundary."""
+        diagnostics = getattr(self, "_prefetch_cost_diagnostics", None)
+        diagnostic = diagnostics.pop(operation.id, {}) if diagnostics else {}
+        if getattr(
+            self, "prefetch_stop_policy", None
+        ) != "cost_aware" or not logger.isEnabledFor(logging.DEBUG):
+            return
+        model = self.prefetch_cost_model
+        independent_pools = [
+            getattr(transfer.name, "value", str(transfer.name))
+            for transfer in operation.pool_transfers or ()
+            if transfer.indices_from_pool != PoolName.KV
+        ]
+        logger.debug(
+            "HiCache prefetch cost decision %s",
+            json.dumps(
+                {
+                    "request_id": operation.handle.rid,
+                    "attempt_id": operation.id,
+                    "terminal": terminal,
+                    "storage_start": operation.storage_start,
+                    "requested_tokens": operation.stats_requested_tokens,
+                    "completed_tokens": operation.completed_tokens,
+                    "expected_tokens": len(operation.hash_value) * self.page_size,
+                    "sidecar_span_tokens": (
+                        len(operation.sidecar_hash_values or ()) * self.page_size
+                    ),
+                    "reuse_mode": (
+                        "all_or_nothing" if independent_pools else "partial"
+                    ),
+                    "independent_pools": independent_pools,
+                    "configured_model": asdict(model) if model is not None else None,
+                    "last_poll_reason": diagnostic.get(
+                        "last_poll_reason", "not_evaluated"
+                    ),
+                    "last_evaluation": diagnostic.get("last_evaluation"),
+                    "fallback_reason": diagnostic.get(
+                        "fallback_reason", "not_evaluated"
+                    ),
+                    "local_vote": diagnostic.get("local_vote", "not_evaluated"),
+                    "agreed_stop_reason": diagnostic.get("agreed_stop_reason"),
+                    "unfulfilled_reason": diagnostic.get("unfulfilled_reason"),
+                },
+                sort_keys=True,
+            ),
+        )
 
     def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
         if operation.host_indices is not None and (
@@ -2380,6 +2486,7 @@ class UnifiedRadixCache(BasePrefixCache):
             # rank stops) and _all_reduce broadcasts the verdict along PP.
             # 0 = keep waiting, 1 = cost, 2 = deadline; a deadline wins ties.
             stop_reason = 0
+            diagnostic = None
             if self.pp_rank == 0:
                 wait = self._storage_prefetch_wait.get(operation.handle)
                 if wait is not None and wait.expired:
@@ -2393,11 +2500,31 @@ class UnifiedRadixCache(BasePrefixCache):
                     and self._prefetch_cost_exceeds_recompute(operation)
                 ):
                     stop_reason = 1
+                diagnostic = self._prefetch_cost_diagnostic_state(operation)
+                if diagnostic is not None and not diagnostic.get("agreed_stop_reason"):
+                    diagnostic["local_vote"] = (
+                        "replayed_agreed_stop"
+                        if wait is not None and wait.expired
+                        else ("keep_waiting", "cost_aware", "deadline")[stop_reason]
+                    )
+                    if stop_reason == 2:
+                        diagnostic["last_poll_reason"] = "deadline"
+            else:
+                diagnostic = self._prefetch_cost_diagnostic_state(operation)
+                if diagnostic is not None:
+                    diagnostic.setdefault("local_vote", "pp_follower")
             should_terminate_tensor = torch.tensor(
                 stop_reason, dtype=torch.int, device="cpu"
             )
             self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
             stop_reason = should_terminate_tensor.item()
+            if diagnostic is not None and stop_reason:
+                # Preserve the original local vote when another rank stopped;
+                # cancellation-drain polls replay the common reason afterwards.
+                diagnostic.setdefault(
+                    "agreed_stop_reason",
+                    "cost_aware" if stop_reason == 1 else "deadline",
+                )
             if stop_reason:
                 # Adopt the reason even when this rank has no local timer yet.
                 wait = self._storage_prefetch_wait.setdefault(
@@ -2563,9 +2690,11 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
-            return self.buffer_pipeline.stage_completed_prefetch(
+            result = self.buffer_pipeline.stage_completed_prefetch(
                 request, completed_tokens, hash_value
             )
+            self._log_prefetch_cost_decision(operation, terminal="buffer_stage")
+            return result
 
         fetched_key = prefetch_key[:completed_tokens]
         insert_result = self.tree_core.insert_host(
@@ -2611,6 +2740,14 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
+        self._log_prefetch_cost_decision(
+            operation,
+            terminal=(
+                "cache_insert_dropped"
+                if insert_result.host_insert_dropped
+                else "cache_inserted"
+            ),
+        )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
@@ -2793,6 +2930,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _finish_storage_prefetch(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
+        self._note_prefetch_terminal_reason(request, reason)
         remaining = self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         if remaining is None:
             return
@@ -2866,6 +3004,7 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        self._note_prefetch_terminal_reason(request, "request_aborted")
         self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(rid)
@@ -2912,6 +3051,7 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         """Drop an in-flight prefetch, releasing ``host_indices`` and ``extra_pools``."""
         info = self.ongoing_prefetch.pop(request)
+        self._log_prefetch_cost_decision(info.operation, terminal="retired")
         if info.anchor_lock_params is not None:
             self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
         if self.buffer_pipeline is not None:
@@ -3800,8 +3940,9 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_metrics = self.cache_controller.storage_backend.get_stats()
             if storage_metrics is None:
                 storage_metrics = StorageMetrics()
-            if not hasattr(storage_metrics, "prefetch_stats"):
-                storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
+            # This field belongs to the controller. Refresh it even when a
+            # backend reuses its StorageMetrics instance across polls.
+            storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
 
     def flush_pending_backups(self) -> None:
