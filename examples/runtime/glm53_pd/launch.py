@@ -26,6 +26,13 @@ def positive_int(value):
     return number
 
 
+def nonnegative_int(value):
+    number = int(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return number
+
+
 def port_number(value):
     number = positive_int(value)
     if number > 65535:
@@ -117,11 +124,27 @@ def build_parser():
                 action="store_true",
                 help="Experimental: opt in on BOTH P and D; default explicitly disables it",
             )
+            role_parser.add_argument(
+                "--eagle-profile",
+                choices=("3/1/4", "5/1/6"),
+                default="3/1/4",
+                help="Steps/top-k/draft tokens; select the same profile on P and D",
+            )
             if role == "decode":
                 role_parser.add_argument(
                     "--enable-dp-admission",
                     action="store_true",
                     help="Opt in to per-rank slot and full-generation KV reservations",
+                )
+                role_parser.add_argument(
+                    "--dp-admission-max-queued-requests",
+                    type=nonnegative_int,
+                    help="Controller-wide queue size; requires --enable-dp-admission (default 0)",
+                )
+                role_parser.add_argument(
+                    "--dp-admission-queue-timeout",
+                    type=positive_float,
+                    help="Finite positive queue deadline in seconds; requires --enable-dp-admission (default 1)",
                 )
             else:
                 role_parser.add_argument(
@@ -232,6 +255,7 @@ def router_command(args):
 
 
 def worker_command(args):
+    eagle_steps, eagle_topk, eagle_draft_tokens = args.eagle_profile.split("/")
     argv = [
         "sglang",
         "serve",
@@ -264,11 +288,11 @@ def worker_command(args):
         "--speculative-algorithm",
         "EAGLE",
         "--speculative-num-steps",
-        "3",
+        eagle_steps,
         "--speculative-eagle-topk",
-        "1",
+        eagle_topk,
         "--speculative-num-draft-tokens",
-        "4",
+        eagle_draft_tokens,
         "--schedule-policy",
         "fcfs",
         "--disaggregation-mode",
@@ -379,9 +403,9 @@ def worker_command(args):
                 [
                     "--enable-dp-admission",
                     "--dp-admission-max-queued-requests",
-                    "0",
+                    str(args.dp_admission_max_queued_requests or 0),
                     "--dp-admission-queue-timeout",
-                    "1.0",
+                    str(args.dp_admission_queue_timeout or 1.0),
                     "--dp-admission-snapshot-timeout",
                     "30.0",
                 ]
@@ -398,6 +422,15 @@ def main(argv=None):
     else:
         if args.model_path is None:
             parser.error("prefill/decode require --model-path or GLM53_MODEL_PATH")
+        if (
+            args.role == "decode"
+            and not args.enable_dp_admission
+            and (
+                args.dp_admission_max_queued_requests is not None
+                or args.dp_admission_queue_timeout is not None
+            )
+        ):
+            parser.error("Decode admission queue options require --enable-dp-admission")
         if args.role == "prefill" and (
             (args.prefill_time_budget_ms is None) != (args.prefill_time_model is None)
         ):

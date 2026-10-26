@@ -5,6 +5,12 @@ been run against GLM-5.3 GPUs as part of this change. Use the same model revisio
 tokenizer, sampling settings, Router budget, P/D replica counts, and hardware for
 each comparison. Record the resolved per-rank capacities before sending load.
 
+For the later operator-reported pd1 configuration and its 96 x 128K:1K C32
+workload, use [NEXT_ROUND.md](NEXT_ROUND.md). It retains the calibrated policies
+while checking the observed EAGLE improvement, and describes the corrected
+benchmark schema and new policy diagnostics. The initial isolation matrix below
+remains useful when validating an individual policy on a separate deployment.
+
 ## Compare one policy at a time
 
 | Run | Prefill | Decode | Compare with |
@@ -161,9 +167,11 @@ bench_case gateway-overload 2048 4096 512 1024
 
 To exercise Decode admission, stay below the Gateway limit and fill rank KV
 budgets with long requests that each fit individually. Record 400, 429, and 503
-separately. The benchmark's `errors` contain reason/body strings, not a separate
-HTTP status array. Collect Gateway metrics and use HTTP probes when an exact
-status is required:
+separately. With the corrected client, `http_status_counts` and `error_counts`
+are always written; `--output-details` also records each request's status,
+success, finish reason, and actual completion tokens. An HTTP 200 stream can
+still fail, so do not substitute status counts for `completed`/`failed_requests`.
+Collect Gateway metrics and use HTTP probes for independent status verification:
 
 ```bash
 curl -sS \

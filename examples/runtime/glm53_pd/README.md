@@ -11,6 +11,12 @@ startup, numerical correctness, capacity, and performance acceptance are still
 required. The CPU tests validate command construction and execution boundaries;
 they do not measure throughput or guarantee that 256 long requests fit in memory.
 
+For the subsequent operator-reported pd1 results (96 requests, 128K:1K, C32),
+the release-feedback fix, decision diagnostics, and a controlled EAGLE comparison,
+see [the next-round procedure](NEXT_ROUND.md). Its candidate profile is explicitly
+selected with `--eagle-profile 5/1/6`; the original launcher defaults remain a
+separate starting point and do not reproduce the deployed pd1 manifest.
+
 ## Review and launch
 
 From the repository root, use any Python 3 environment to print a launch plan.
@@ -58,7 +64,7 @@ the workers use their checkpoint's template.
 ## Deployment options
 
 Run `launch.py ROLE --help` for the role's options. The defaults preserve the
-existing deployment addresses and selectors:
+original example's addresses and selectors; they are not the later pd1 manifest:
 
 | Option | Applies to | Default / behavior |
 | --- | --- | --- |
@@ -68,6 +74,7 @@ existing deployment addresses and selectors:
 | `--model-path` | P, D | Required unless `GLM53_MODEL_PATH` is set |
 | `--ib-devices` | P, D | `GLM53_IB_DEVICES`, otherwise `mlx5_bond_0` through `mlx5_bond_7`, comma-separated |
 | `--chat-template` | P, D | Use the checkpoint template unless explicitly supplied |
+| `--eagle-profile` | P, D | `3/1/4` by default; `5/1/6` selects five steps, top-k one, six draft tokens; set the same profile on both roles |
 | `--namespace` | Router | `sglang2` |
 | `--group-name` | Router | `sglang-pd2` |
 | `--worker-port` | Router | `8000`; must match the workers' HTTP port |
@@ -75,6 +82,8 @@ existing deployment addresses and selectors:
 | `--max-concurrent-requests` | Router | `256` HTTP requests per Router process |
 | `--all-cp-ranks-transfer` | P, D | Explicit experimental opt-in; see below |
 | `--enable-dp-admission` | D | Explicit per-rank request and full-generation KV reservations; off by default |
+| `--dp-admission-max-queued-requests` | D | Controller-wide queue capacity, default `0`; requires `--enable-dp-admission` |
+| `--dp-admission-queue-timeout` | D | Finite positive queue deadline in seconds, default `1`; requires `--enable-dp-admission` |
 | `--hicache-storage-prefetch-cost-model` | P | Calibrated JSON; explicitly selects `cost_aware` instead of the default `timeout` |
 | `--prefill-time-budget-ms` and `--prefill-time-model` | P | Paired opt-in for a calibrated per-batch time estimate; both absent by default |
 
@@ -150,6 +159,21 @@ launch. The default launcher does not enable this new policy before GPU
 acceptance. The Gateway should select Decode pods; the Decode controller then
 selects and reserves a rank, with no external `--dp-aware` rank override.
 
+The queue capacity and deadline can be set explicitly. For example, the
+operator-reported pd1 queue capacity and EAGLE profile can be represented as:
+
+```bash
+python3 examples/runtime/glm53_pd/launch.py decode \
+  --enable-dp-admission --dp-admission-max-queued-requests 64 \
+  --eagle-profile 5/1/6
+```
+
+This prints a command; it does not read or update the deployment. Confirm the
+actual deployed queue deadline and pass `--dp-admission-queue-timeout` if it
+differs from the launcher's default. Use `--eagle-profile 5/1/6` on Prefill too.
+The queue is shared by the Decode controller, not a separate 64-entry queue on
+each attention DP rank.
+
 The controller reserves both a request slot and the full effective prompt/output
 KV budget, including the runtime's decode and PD preallocation reserves and page
 alignment. A scheduler acknowledgement transfers accounting from pending
@@ -158,6 +182,13 @@ final response, or canceling HTTP does not refund an allocation that is still
 held by transfer or retraction cleanup. This protects a shared Decode engine
 across Gateway replicas; Gateway limits remain useful for limiting CPU and HTTP
 work before the engine's admission decision.
+
+With admission enabled, completed result processing now publishes capacity after
+allocator group release. A real ledger release or a decrease in the allocator
+token floor triggers an early snapshot; ordinary decode steps retain periodic
+publication. Failed writes keep the release pending. This removes a reproducible
+feedback delay while preserving deferred Mooncake ownership; it does not
+establish a throughput gain or imply that the current C32 workload fills KV.
 
 Set realistic `max_new_tokens` or OpenAI output-token limits on client requests.
 When no output limit is supplied, the policy reserves the effective remaining

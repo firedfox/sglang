@@ -100,6 +100,53 @@ class TestGLM53PDLaunch(unittest.TestCase):
                 ):
                     self.assertEqual(self.value(plan, flag), expected)
 
+    def test_measured_eagle_profile_is_explicit_and_matches_both_workers(self):
+        for role in ("prefill", "decode"):
+            plan = self.plan(
+                role, "--model-path", "/models/glm53", "--eagle-profile", "5/1/6"
+            )
+            self.assertEqual(self.value(plan, "--speculative-num-steps"), "5")
+            self.assertEqual(self.value(plan, "--speculative-eagle-topk"), "1")
+            self.assertEqual(self.value(plan, "--speculative-num-draft-tokens"), "6")
+        self.assert_invalid("router", "--eagle-profile", "5/1/6")
+        self.assert_invalid(
+            "decode", "--model-path", "/models/glm53", "--eagle-profile", "6/5"
+        )
+
+    def test_admission_queue_overrides_require_admission_and_validate_values(self):
+        options = ("--model-path", "/models/glm53", "--enable-dp-admission")
+        plan = self.plan(
+            "decode",
+            *options,
+            "--dp-admission-max-queued-requests",
+            "64",
+            "--dp-admission-queue-timeout",
+            "2.5",
+        )
+        self.assertEqual(self.value(plan, "--dp-admission-max-queued-requests"), "64")
+        self.assertEqual(self.value(plan, "--dp-admission-queue-timeout"), "2.5")
+        for flag, values in (
+            ("--dp-admission-max-queued-requests", ("-1", "1.5")),
+            ("--dp-admission-queue-timeout", ("0", "-1", "nan", "inf")),
+        ):
+            for value in values:
+                with self.subTest(flag=flag, value=value):
+                    self.assert_invalid("decode", *options, flag, value)
+        self.assert_invalid(
+            "decode",
+            "--model-path",
+            "/models/glm53",
+            "--dp-admission-max-queued-requests",
+            "0",
+        )
+        self.assert_invalid(
+            "decode",
+            "--model-path",
+            "/models/glm53",
+            "--dp-admission-queue-timeout",
+            "1",
+        )
+
     def test_prefill_uses_cp8_and_automatic_hicache_sizing(self):
         plan = self.plan("prefill", "--model-path", "/models/glm53")
         for flag, expected in (

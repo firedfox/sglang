@@ -5,7 +5,7 @@ This record covers CPU, HTTP, IPC, and scheduling checks performed while buildin
 `ef11eb3b76354ffbabd9f17a2343e79522e41cf2`. It is not a GLM-5.3 GPU benchmark or
 a production deployment result. No model weights were loaded for these checks.
 
-## Results
+## Initial branch checks
 
 | Area | Result | What the checks establish |
 | --- | --- | --- |
@@ -26,6 +26,71 @@ An independent reviewer also checked the time-budget selector against an
 exhaustive legal-chunk oracle for 100,000 seeded random cases; all matched.
 The repository's Python formatting/import checks and configured Ruff rules
 passed for the new scheduling code, as did `git diff --check`.
+
+## Follow-up after the operator's pd1 report
+
+The operator separately reported a deployed v0.5.18 backport and four GPU runs.
+Those raw files and the deployed patch are not present in this checkout. The
+following checks validate this branch's new code; they neither reproduce those
+GPU measurements nor establish a performance gain on pd1.
+
+| Area | Result | What the checks establish |
+| --- | --- | --- |
+| Benchmark measurement | 34 tests and 27 subtests passed | Actual localhost native SSE/JSON, truncated EOF and abort/error handling, all-failed main-run JSON, workload timing, weighted MTP counters, exact in-flight intervals, existing prompt/goodput/reasoning/steady-state compatibility |
+| Decode release feedback | 83 tests and 21 subtests passed | Real scheduler/EAGLE result control flow, deferred ownership, allocator floor, stale running references, event coalescing, failed-write retry, ZMQ roundtrips and default-off compatibility |
+| L3 diagnostics | 78 tests passed, including multiprocess Gloo cases | Cumulative outcome deltas and resets, reused stats objects, bounded labels, one terminal debug record per attempt, cost inputs, rank agreement and unchanged lifecycle decisions |
+| Prefill budget diagnostics and launcher/planner | 122 tests passed | The existing 99-case Prefill group, 19 launcher cases and 4 offline manifest cases; committed shape/count snapshots, input/alignment limits, EAGLE profiles, explicit queue overrides and namespace isolation |
+
+The release-feedback regression also ran against the original scheduler methods
+from `f72308a`: it failed its expected post-release publication assertion, with
+no fixture error. The new implementation passes. A separate seeded comparison
+of 10,000 old/new pure time-budget selector inputs found identical selections.
+These are correctness checks, not CPU overhead or GPU speed benchmarks.
+
+Local HTTP, Unix IPC and Gloo tests ran with permission to create local sockets.
+No CUDA kernel, RDMA transfer or running Mooncake service was exercised. Rust
+Gateway code was unchanged in this follow-up; its earlier build is recorded
+above rather than claimed as a new build. Python import/format checks, the
+configured Ruff rule subset and `git diff --check` were run on modified files.
+Only example Markdown was changed here; the earlier MDX validation record below
+is unchanged.
+
+Reproduce the follow-up groups from the repository root in a CPU test environment:
+
+```bash
+export PYTHONPATH=python
+export SGLANG_CACHE_DIR=/tmp/sglang-glm53-test-cache
+
+python3 -m pytest -q \
+  test/registered/unit/bench/test_serving_measurement.py \
+  test/registered/unit/bench/test_bench_serving_prompt_len.py \
+  test/registered/unit/bench/test_bench_serving_goodput.py \
+  test/registered/bench_fn/test_bench_serving_reasoning_stream.py \
+  test/registered/bench_fn/test_steady_state_benchmark.py
+
+python3 -m pytest -q \
+  test/registered/unit/managers/test_dp_admission_integration.py \
+  test/registered/unit/managers/test_dp_admission.py \
+  test/registered/unit/managers/test_load_inquirer.py \
+  test/registered/unit/managers/test_scheduler_on_idle_load.py \
+  test/registered/unit/managers/test_load_snapshot_backends.py
+
+GLOO_SOCKET_IFNAME=lo python3 -m unittest \
+  test.registered.unit.mem_cache.test_prefetch_cost \
+  test.registered.unit.mem_cache.test_storage_prefetch_metrics \
+  test.registered.unit.mem_cache.test_storage_prefetch_lifecycle \
+  test.registered.unit.server_args.test_hicache_prefetch_cost_args \
+  test.registered.unit.observability.test_stat_loggers_di
+
+python3 -m unittest \
+  test.registered.unit.managers.scheduler_components.test_prefill_time_budget \
+  test.registered.unit.server_args.test_prefill_time_budget_args \
+  test.registered.unit.managers.test_prefill_adder \
+  test.registered.unit.managers.test_deterministic_chunk_align \
+  test.registered.unit.managers.test_scheduler_held_row_admission \
+  test.registered.unit.test_glm53_pd_launch \
+  test.registered.unit.test_glm53_pd_plan
+```
 
 ## Environment and limits
 
