@@ -1178,6 +1178,12 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
 
+    # Internal controller-to-scheduler admission protocol, never client input.
+    # Append-only tail fields preserve the existing positional IPC schema.
+    dp_admission_epoch: str = ""
+    dp_admission_sequence: int = 0
+    dp_admission_tokens: int = 0
+
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
 

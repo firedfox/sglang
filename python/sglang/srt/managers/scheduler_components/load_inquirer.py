@@ -58,6 +58,7 @@ class SchedulerLoadInquirer:
     get_waiting_storage_span: (
         Callable[[CacheRequestHandle], tuple[int, int] | None] | None
     ) = None
+    get_dp_admission_snapshot: Callable[[int], dict] | None = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -227,6 +228,11 @@ class SchedulerLoadInquirer:
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
+            **(
+                self.get_dp_admission_snapshot(num_used_tokens)
+                if self.get_dp_admission_snapshot is not None
+                else {}
+            ),
             dp_rank=int(get_parallel().dp_rank)
             if get_parallel().dp_rank is not None
             else 0,

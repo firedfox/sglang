@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, FrozenSet, List
 _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
         "handle_deprecated_dp_attention",
+        "validate_dp_admission",
         "handle_mega_moe",
         "handle_return_hidden_states_mode",
         "handle_media_url_security",

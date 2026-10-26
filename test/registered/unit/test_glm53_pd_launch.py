@@ -161,6 +161,24 @@ class TestGLM53PDLaunch(unittest.TestCase):
                     "/models/explicit snapshot $(no-shell)",
                 )
 
+    def test_dp_admission_is_an_explicit_decode_only_opt_in(self):
+        baseline = self.plan("decode", "--model-path", "/models/glm53")
+        self.assertNotIn("--enable-dp-admission", baseline["argv"])
+        plan = self.plan(
+            "decode", "--model-path", "/models/glm53", "--enable-dp-admission"
+        )
+        self.assertEqual(plan["argv"].count("--enable-dp-admission"), 1)
+        for flag, expected in (
+            ("--dp-admission-max-queued-requests", "0"),
+            ("--dp-admission-queue-timeout", "1.0"),
+            ("--dp-admission-snapshot-timeout", "30.0"),
+        ):
+            self.assertEqual(self.value(plan, flag), expected)
+        self.assert_invalid("router", "--enable-dp-admission")
+        self.assert_invalid(
+            "prefill", "--model-path", "/models/glm53", "--enable-dp-admission"
+        )
+
     def test_worker_model_path_is_required(self):
         for role in ("prefill", "decode"):
             with self.subTest(role=role):

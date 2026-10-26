@@ -44,6 +44,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Before any handler reads the DP layout.
     run_hook(handle_deprecated_dp_attention, server_args)
 
+    from sglang.srt.arg_groups.dp_admission_hook import validate_dp_admission
+
+    # Reject unsupported opt-ins before model downloads or dummy-model return.
+    run_hook(validate_dp_admission, server_args)
+
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)
@@ -370,5 +375,9 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    # Recheck resolved topology, caches, and speculative settings after every
+    # declaration, including defaults selected from the model architecture.
+    run_hook(validate_dp_admission, server_args)
 
     server_args._resolution_finished = True

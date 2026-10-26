@@ -36,7 +36,13 @@ from sglang.srt.elastic_ep.topology import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import compute_dp_attention_world_info
+from sglang.srt.managers.dp_admission import (
+    DPAdmissionController,
+    DPAdmissionError,
+    DPAdmissionRequest,
+)
 from sglang.srt.managers.io_struct import (
+    AbortReq,
     ActiveRanksOutput,
     BatchTokenizedEmbeddingReqInput,
     BatchTokenizedGenerateReqInput,
@@ -53,6 +59,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 from sglang.srt.managers.utils import is_health_check_generate_req
 from sglang.srt.mem_cache.hicache_storage import merge_l3_layouts
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -227,6 +234,20 @@ class DataParallelController:
             caller="DataParallelController",
         )
         self._last_refresh_time = 0.0
+        self.dp_admission = None
+        if parallel.enable_dp_admission:
+            self.dp_admission = DPAdmissionController(
+                parallel.num_dp_ranks,
+                port_args.instance_id,
+                max_queued_requests=parallel.dp_admission_max_queued_requests,
+                queue_timeout=parallel.dp_admission_queue_timeout,
+                snapshot_timeout=parallel.dp_admission_snapshot_timeout,
+            )
+            self.send_to_tokenizer = SenderWrapper(
+                get_zmq_socket(
+                    self.context, zmq.PUSH, port_args.tokenizer_ipc_name, False
+                )
+            )
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -358,9 +379,24 @@ class DataParallelController:
         if now - self._last_refresh_time < 0.02:
             return
         self._last_refresh_time = now
-        self.dp_budget.update_budget(self.load_snapshot_reader.read_all())
+        admission = getattr(self, "dp_admission", None)
+        try:
+            loads = self.load_snapshot_reader.read_all()
+        except Exception:
+            if admission is None:
+                raise
+            for rank in admission.ranks:
+                rank.ready = False
+            logger.exception("Cannot read decode DP admission capacity snapshots")
+            return
+        self.dp_budget.update_budget(loads)
+        if admission is not None:
+            admission.update(loads, now)
 
     def dispatching_with_trace(self, req: Req, refresh_load_budget: bool = True):
+        if getattr(self, "dp_admission", None) is not None:
+            self.dispatch_with_admission(req, refresh_load_budget)
+            return
         is_health_check = is_health_check_generate_req(req)
         if (
             not is_health_check
@@ -382,11 +418,159 @@ class DataParallelController:
         req.time_stats = time_stats
         req.time_stats.set_dp_dispatch_finish_time()
 
+    @staticmethod
+    def _admission_request_cost(req) -> DPAdmissionRequest:
+        if not isinstance(req, TokenizedGenerateReqInput):
+            raise DPAdmissionError(
+                400, "Decode DP admission supports text generation only."
+            )
+        if (
+            req.mm_inputs is not None
+            or req.input_embeds is not None
+            or req.positional_embed_overrides is not None
+            or req.session_id is not None
+            or req.session_params is not None
+            or req.input_ids is None
+            or (req.sampling_params.beam_width or 1) > 1
+        ):
+            raise DPAdmissionError(
+                400,
+                "Decode DP admission does not support multimodal or embedding "
+                "inputs, sessions, or beam search.",
+            )
+        return DPAdmissionRequest(
+            len(req.input_ids),
+            req.sampling_params.max_new_tokens,
+            req.routed_dp_rank,
+        )
+
+    def _reject_admission(self, req, error: DPAdmissionError) -> None:
+        self.send_to_tokenizer.send_output(
+            AbortReq(
+                rid=req.rid,
+                finished_reason={
+                    "type": "abort",
+                    "status_code": error.status_code,
+                    "message": str(error),
+                    "dp_admission_rejected": 1,
+                },
+            ),
+            req,
+        )
+
+    def _send_admitted_request(self, req, rank: int, tokens: int) -> None:
+        admission = self.dp_admission
+        reservation = admission.reserve(rank, tokens)
+        original_time_stats = req.time_stats
+        time_stats = None
+        try:
+            req.dp_admission_epoch = admission.epoch
+            req.dp_admission_sequence = reservation.sequence
+            req.dp_admission_tokens = reservation.tokens
+            time_stats = DPControllerReqTimeStats.new_from_obj(
+                unwrap_from_pickle(req.time_stats)
+            )
+            time_stats.set_dp_dispatch_time()
+            req.time_stats = wrap_as_pickle(time_stats)
+            # A single-frame nonblocking send either queues the whole message or
+            # fails without dispatching it. Do not block the bounded admission
+            # queue or cancellation polling behind a worker's socket backlog.
+            sock_send(self.workers[rank], req, flags=zmq.NOBLOCK)
+        except Exception as exc:
+            admission.rollback_unsent(reservation)
+            logger.warning("DP admission dispatch to rank %d failed: %s", rank, exc)
+            self._reject_admission(
+                req, DPAdmissionError(503, "Failed to dispatch to the decode rank.")
+            )
+        finally:
+            req.time_stats = (
+                time_stats if time_stats is not None else original_time_stats
+            )
+            if time_stats is not None:
+                try:
+                    time_stats.set_dp_dispatch_finish_time()
+                except Exception:
+                    # A tracing failure after a successful send is not evidence
+                    # that the worker did not receive its reservation.
+                    logger.exception("Failed to finish DP admission dispatch trace")
+
+    def dispatch_with_admission(self, req, refresh_load_budget: bool = True):
+        admission = self.dp_admission
+        if refresh_load_budget:
+            self.refresh_load_budget()
+        now = time.perf_counter()
+        try:
+            cost = self._admission_request_cost(req)
+            try:
+                rank, tokens = admission.choose(cost, self._active_workers, now)
+            except DPAdmissionError as error:
+                if error.status_code != 429:
+                    raise
+                admission.enqueue(req, cost, now)
+                return
+
+            if admission.queue:
+                # Preserve FIFO ordering even when a later, smaller request fits.
+                admission.enqueue(req, cost, now)
+                return
+            # Health requests obey the same budget: their rid prefix is client
+            # controlled, and transfer-only work can look idle to health probes.
+            # A busy scheduler may skip the probe, but still ACKs its sequence.
+            self._send_admitted_request(req, rank, tokens)
+        except DPAdmissionError as error:
+            self._reject_admission(req, error)
+
+    def poll_dp_admission(self) -> None:
+        admission = getattr(self, "dp_admission", None)
+        if admission is None:
+            return
+        now = time.perf_counter()
+        if now - self._last_refresh_time < 0.02:
+            return
+        self.refresh_load_budget()
+        while admission.queue:
+            entry = admission.queue[0]
+            if now >= entry.deadline:
+                admission.queue.popleft()
+                self._reject_admission(
+                    entry.request,
+                    DPAdmissionError(429, "Decode admission queue wait timed out."),
+                )
+                continue
+            try:
+                rank, tokens = admission.choose(entry.cost, self._active_workers, now)
+            except DPAdmissionError as error:
+                if error.status_code == 429:
+                    break
+                admission.queue.popleft()
+                self._reject_admission(entry.request, error)
+                continue
+            admission.queue.popleft()
+            self._send_admitted_request(entry.request, rank, tokens)
+
+    def handle_abort_request(self, req: AbortReq) -> None:
+        admission = getattr(self, "dp_admission", None)
+        if admission is not None:
+            for queued_req in admission.abort_queued(req.rid, req.abort_all):
+                self.send_to_tokenizer.send_output(
+                    AbortReq(
+                        rid=queued_req.rid,
+                        finished_reason=req.finished_reason,
+                        abort_message=req.abort_message,
+                    ),
+                    queued_req,
+                )
+        # Already-dispatched work retains its reservation until the scheduler
+        # observes terminal output AND releases KV, including transfer drains.
+        self.send_control_message(req)
+
     def dispatch_batch_generate(self, batch_req: BatchTokenizedGenerateReqInput):
         has_user_request = any(
             not is_health_check_generate_req(req) for req in batch_req
         )
-        if has_user_request and self.refresh_load_budget_on_dispatch:
+        if self.refresh_load_budget_on_dispatch and (
+            has_user_request or getattr(self, "dp_admission", None) is not None
+        ):
             self.refresh_load_budget()
         for req in batch_req:
             self.dispatching_with_trace(req, refresh_load_budget=False)
@@ -406,6 +590,7 @@ class DataParallelController:
                 (BatchTokenizedEmbeddingReqInput, self.dispatch_batch_embedding),
                 (BlockReqInput, self.send_to_all_workers),
                 (ProfileReq, self.send_to_all_workers),
+                (AbortReq, self.handle_abort_request),
                 (ActiveRanksOutput, self.update_active_ranks),
                 (
                     ElasticScaleUpdateReq,
@@ -925,9 +1110,12 @@ class DataParallelController:
         sock_send(self.workers[target_worker], req)
 
     def event_loop(self):
+        admission_enabled = self.dp_admission is not None
         while True:
             while True:
                 self.soft_watchdog.feed()
+                if admission_enabled:
+                    self.poll_dp_admission()
                 try:
                     recv_req = sock_recv(self.recv_from_tokenizer, flags=zmq.NOBLOCK)
                 except zmq.ZMQError:

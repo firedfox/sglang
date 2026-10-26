@@ -98,6 +98,12 @@ def build_parser():
                 action="store_true",
                 help="Experimental: opt in on BOTH P and D; default explicitly disables it",
             )
+            if role == "decode":
+                role_parser.add_argument(
+                    "--enable-dp-admission",
+                    action="store_true",
+                    help="Opt in to per-rank slot and full-generation KV reservations",
+                )
     return parser
 
 
@@ -313,6 +319,18 @@ def worker_command(args):
                 "--stream-response-default-include-usage",
             ]
         )
+        if args.enable_dp_admission:
+            argv.extend(
+                [
+                    "--enable-dp-admission",
+                    "--dp-admission-max-queued-requests",
+                    "0",
+                    "--dp-admission-queue-timeout",
+                    "1.0",
+                    "--dp-admission-snapshot-timeout",
+                    "30.0",
+                ]
+            )
     return argv
 
 

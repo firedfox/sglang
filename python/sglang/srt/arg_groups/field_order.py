@@ -549,5 +549,9 @@ POSITIONAL_FIELD_ORDER = (
     "enable_http_worker_reuseport",
     "prefill_decode_interval_min_bs",
     "unified_cache_external_linker_config",
+    "enable_dp_admission",
+    "dp_admission_max_queued_requests",
+    "dp_admission_queue_timeout",
+    "dp_admission_snapshot_timeout",
 )
 # fmt: on

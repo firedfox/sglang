@@ -74,6 +74,7 @@ existing deployment addresses and selectors:
 | `--prometheus-port` | Router | `9090`, exposed on `0.0.0.0` |
 | `--max-concurrent-requests` | Router | `256` HTTP requests per Router process |
 | `--all-cp-ranks-transfer` | P, D | Explicit experimental opt-in; see below |
+| `--enable-dp-admission` | D | Explicit per-rank request and full-generation KV reservations; off by default |
 
 The Router selects pods using `rbg.workloads.x-k8s.io/role-name=prefill` or
 `decode`, together with `rbg.workloads.x-k8s.io/group-name=GROUP`. Its service
@@ -132,6 +133,45 @@ aggregate limit at 256. Budget for rolling-update overlap too. Independent Route
 limits do not coordinate across replicas, and a 256-request cap still does not
 account for request length or per-rank KV pressure. Lower the aggregate limit
 when long-context capacity or measured latency requires it.
+
+### Decode rank admission
+
+After the baseline starts correctly, review the optional capacity-aware command:
+
+```bash
+python3 examples/runtime/glm53_pd/launch.py decode --enable-dp-admission
+```
+
+The opt-in adds `--enable-dp-admission`, a zero-length admission queue, a 1-second
+queue timeout, and a 30-second snapshot timeout. Add `--run` only when ready to
+launch. The default launcher does not enable this new policy before GPU
+acceptance. The Gateway should select Decode pods; the Decode controller then
+selects and reserves a rank, with no external `--dp-aware` rank override.
+
+The controller reserves both a request slot and the full effective prompt/output
+KV budget, including the runtime's decode and PD preallocation reserves and page
+alignment. A scheduler acknowledgement transfers accounting from pending
+dispatch to live commitments. Merely receiving a fresh timestamp, emitting a
+final response, or canceling HTTP does not refund an allocation that is still
+held by transfer or retraction cleanup. This protects a shared Decode engine
+across Gateway replicas; Gateway limits remain useful for limiting CPU and HTTP
+work before the engine's admission decision.
+
+An individually impossible request receives 400, occupied budgets receive 429,
+and unavailable or stale rank capacity receives 503. With zero queue size there
+is no additional Decode admission wait. The Gateway cancels the paired Prefill
+on early Decode rejection and preserves 429 and any upstream `Retry-After` header.
+
+This first version supports the fixed single-node Decode layout in the example,
+text generation, early Mooncake allocation, disabled decode radix cache, and
+fixed top-k-one speculation. Native `/generate`, Chat Completions, and Completions
+can return admission failures before streaming headers. Streaming batches and
+`n > 1` streaming, `POST /v1/responses`, and Anthropic streaming are rejected in
+this mode; they are unchanged when it is off. Sessions, multimodal/embedding
+inputs, beam search, LoRA, adaptive speculation, role switching, and hybrid or
+offloaded KV layouts are outside the initial contract. See the
+[PD admission documentation](../../../docs/docs/advanced_features/pd_disaggregation.mdx#decode-dp-admission)
+for the full scope.
 
 ### Optional all-CP-rank transfer experiment
 

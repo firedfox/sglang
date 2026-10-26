@@ -118,6 +118,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.dp_admission import SchedulerDPAdmission
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -294,6 +295,7 @@ from sglang.srt.managers.utils import (
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -725,6 +727,8 @@ class Scheduler(
         self.init_invariant_checker()
 
         self.init_load_publisher()
+
+        self.init_dp_admission(port_args)
 
         self.init_load_inquirer()
 
@@ -2228,6 +2232,14 @@ class Scheduler(
         for recv_req in recv_reqs:
             # Before any early exit, so every request releases its CUDA IPC pool slot.
             for tokenized_req in self._tokenized_requests(recv_req):
+                admission = getattr(self, "dp_admission", None)
+                if admission is not None and isinstance(
+                    tokenized_req, TokenizedGenerateReqInput
+                ):
+                    # The loop is ordered and snapshots are published only after
+                    # input processing. ACK even busy health checks that return
+                    # before constructing a Req, so their reservation cannot leak.
+                    admission.acknowledge(tokenized_req)
                 if tokenized_req.positional_embed_overrides is not None:
                     tokenized_req.positional_embed_overrides.reconstruct(
                         get_device().gpu_id
@@ -2272,6 +2284,9 @@ class Scheduler(
     def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
         """Report a request the scheduler ends outside the output stream
         (aborted while queued, preempted, retracted or rejected)."""
+        admission = getattr(self, "dp_admission", None)
+        if admission is not None:
+            admission.mark_terminal(req)
         if self.rust_server is not None:
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)
@@ -2576,6 +2591,30 @@ class Scheduler(
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
 
+    def init_dp_admission(self, port_args: PortArgs) -> None:
+        self.dp_admission = None
+        if not get_parallel().enable_dp_admission:
+            return
+        if (
+            self.is_hybrid_swa
+            or self.is_hybrid_ssm
+            or self.model_config.is_multimodal
+            or not self.model_config.is_generation
+            or self.kv_shard_widening != 1
+        ):
+            raise ValueError(
+                "--enable-dp-admission requires a text generation model with "
+                "a single full-attention KV capacity (no SWA/SSM or KV sharding)."
+            )
+        self.dp_admission = SchedulerDPAdmission(
+            port_args.instance_id,
+            page_size=self.page_size,
+            decode_reserve=get_alloc_reserve_per_decode(),
+            prealloc_reserve=get_disagg().num_reserved_decode_tokens,
+            max_sequence_length=self.max_req_len,
+            max_new_tokens_limit=self.max_new_tokens_limit,
+        )
+
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
@@ -2628,6 +2667,11 @@ class Scheduler(
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
+            get_dp_admission_snapshot=(
+                self.dp_admission.snapshot
+                if getattr(self, "dp_admission", None) is not None
+                else None
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2938,7 +2982,11 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
-        return Req(*args, **kwargs)
+        req = Req(*args, **kwargs)
+        admission = getattr(self, "dp_admission", None)
+        if admission is not None:
+            admission.bind(req, recv_req)
+        return req
 
     def handle_generate_request(
         self,
