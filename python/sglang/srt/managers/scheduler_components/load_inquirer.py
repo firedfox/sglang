@@ -110,7 +110,20 @@ class SchedulerLoadInquirer:
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        running_reqs = self.get_running_batch().reqs
+        num_running_reqs = len(running_reqs)
+        if self.get_dp_admission_snapshot is not None:
+            # Admission snapshots can now be published just after processing a
+            # result, before the next scheduling step filters finished rows.
+            # Do not let those stale references hide a released request slot.
+            # A terminal request that still owns deferred KV remains counted.
+            num_running_reqs -= sum(
+                bool(req.finished_output)
+                and not req.kv.holds_kv
+                and not req.kv.holds_mamba
+                and req.kv.retraction_backup is None
+                for req in running_reqs
+            )
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]

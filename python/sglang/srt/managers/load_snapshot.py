@@ -425,7 +425,8 @@ class ZmqLoadSnapshotWriter:
         self._socket.setsockopt(_zmq.CONFLATE, 1)
         zmq_connect(self._socket, endpoint)
 
-    def write(self, snapshot: LoadSnapshot) -> None:
+    def write(self, snapshot: LoadSnapshot) -> bool:
+        """Return False if the nonblocking transport could not queue the snapshot."""
         if snapshot.dp_rank != self.dp_rank:
             raise ValueError(
                 f"snapshot dp_rank={snapshot.dp_rank} does not match "
@@ -434,7 +435,8 @@ class ZmqLoadSnapshotWriter:
         try:
             self._socket.send(snapshot_encoder.encode(snapshot), self._zmq.NOBLOCK)
         except self._zmq.Again:
-            pass
+            return False
+        return True
 
     def close(self) -> None:
         self._socket.close()

@@ -8,6 +8,7 @@ from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
 import zmq
 
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -32,13 +33,26 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     sock_recv,
 )
-from sglang.srt.managers.load_snapshot import LoadSnapshot
+from sglang.srt.managers.load_snapshot import (
+    LoadSnapshot,
+    ZmqLoadSnapshotWriter,
+    snapshot_decoder,
+)
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.managers.scheduler_components.pool_stats_observer import (
+    SchedulerPoolStatsObserver,
+)
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=8, suite="base-a-test-cpu")
@@ -88,7 +102,7 @@ def ledger():
     )
 
 
-class TestDPAdmissionIPC(unittest.TestCase):
+class DPAdmissionIPCTestCase(unittest.TestCase):
     def setUp(self):
         reset_context()
         publish(ServerArgs(model_path="dummy"), role="test")
@@ -140,6 +154,8 @@ class TestDPAdmissionIPC(unittest.TestCase):
     def recv(self, socket):
         return sock_recv(socket, flags=zmq.NOBLOCK)
 
+
+class TestDPAdmissionIPC(DPAdmissionIPCTestCase):
     def test_dispatch_encodes_reservation_and_preserves_sampling(self):
         ctl = self.controller()
         req = request(output=37, http_worker_ipc="worker-7")
@@ -297,6 +313,408 @@ class TestDPAdmissionIPC(unittest.TestCase):
         self.assertEqual(ctl.dp_admission.ranks[0].total_requests, 1)
         with self.assertRaises(zmq.Again):
             self.recv(self.receivers[0])
+
+
+class TestDPAdmissionReleaseSnapshots(DPAdmissionIPCTestCase):
+    """Real result processing, load inquiry, KV ownership and controller IPC."""
+
+    def scheduler(self, *, capacity=1280, slots=2, enabled=True):
+        reset_context()
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="EAGLE",
+            speculative_num_steps=5,
+            speculative_eagle_topk=1,
+            speculative_num_draft_tokens=6,
+        )
+        publish(args, role="test")
+        self.enterContext(get_parallel().override(dp_rank=0))
+        sched = Scheduler.__new__(Scheduler)
+        sched.server_args = args
+        sched.dp_admission = ledger() if enabled else None
+        if enabled:
+            sched.dp_admission.decode_reserve = 12
+        sched.scheduler_stage_metrics = None
+        sched.rust_server = None
+        sched.ipc_channels = SimpleNamespace(send_to_tokenizer=MagicMock())
+        sched.running_batch = SimpleNamespace(reqs=[])
+        sched.waiting_queue = []
+        sched.chunked_req = None
+        sched.disaggregation_mode = DisaggregationMode.DECODE
+        sched.disagg_decode_prealloc_queue = SimpleNamespace(
+            queue=[], retracted_queue=[]
+        )
+        sched.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        sched.max_total_num_tokens = capacity
+        sched.max_running_requests = slots
+        sched.kv_shard_widening = 1
+        sched.spec_algorithm = SpeculativeAlgorithm.EAGLE
+        sched.tp_worker = None
+
+        # The allocator's grouped free is deliberately observable: dropping a
+        # Req's ownership before free_group_end must not refund occupied pages.
+        self.used_tokens = 0
+        self.pending_free_tokens = 0
+        self.in_free_group = False
+        self.defer_allocator_free = False
+        self.before_free_group_end = lambda: None
+        allocator = MagicMock(page_size=64)
+        allocator.available_size.side_effect = lambda: capacity - self.used_tokens
+
+        def begin():
+            self.in_free_group = True
+
+        def end():
+            self.before_free_group_end()
+            self.in_free_group = False
+            if not self.defer_allocator_free:
+                self.used_tokens -= self.pending_free_tokens
+                self.pending_free_tokens = 0
+
+        def free_row(kv, spans):
+            tokens = (kv.kv_allocated_len + 63) // 64 * 64
+            if self.in_free_group:
+                self.pending_free_tokens += tokens
+            else:
+                self.used_tokens -= tokens
+
+        allocator.free_group_begin.side_effect = begin
+        allocator.free_group_end.side_effect = end
+        sched.token_to_kv_pool_allocator = allocator
+        pool = ReqToTokenPool.__new__(ReqToTokenPool)
+        pool.free_slots = []
+        pool._aux_cache = None
+        sched.req_to_token_pool = pool
+        tree = MagicMock()
+        tree.claim_kv_row.return_value = False
+        tree.supports_mamba.return_value = False
+        tree.evictable_size.return_value = 0
+        tree.free_kv_row.side_effect = free_row
+        tree.req_to_token_pool = pool
+        tree.token_to_kv_pool_allocator = allocator
+        sched.tree_cache = tree
+        sched.pool_stats_observer = SchedulerPoolStatsObserver(
+            tree_cache=tree,
+            token_to_kv_pool_allocator=allocator,
+            req_to_token_pool=pool,
+            session_controller=None,
+            hisparse_coordinator=None,
+            is_hybrid_swa=False,
+            is_hybrid_ssm=False,
+            enable_hisparse=False,
+            full_tokens_per_layer=None,
+            swa_tokens_per_layer=None,
+            max_total_num_tokens=capacity,
+        )
+        sched.metrics_reporter = MagicMock()
+        sched.metrics_reporter.spec_total_num_forward_ct = 0
+        sched.metrics_reporter.forward_ct_decode = 0
+        sched.metrics_reporter.stats = SimpleNamespace(
+            gen_throughput=0,
+            cache_hit_rate=0,
+            utilization=0,
+            kv_transfer_speed_gb_s=0,
+            kv_transfer_latency_ms=0,
+            num_grammar_queue_reqs=0,
+            num_paused_reqs=0,
+            num_retracted_reqs=0,
+        )
+        sched.init_load_inquirer()
+        self.published = []
+        sched.load_snapshot_writer = SimpleNamespace(
+            publish_counter=0,
+            publish_interval=15,
+            write=MagicMock(side_effect=self.published.append),
+        )
+        sched.load_publisher = MagicMock()
+        sched._record_step_counters = MagicMock()
+        sched.enable_fpm = False
+        sched._maybe_clear_mm_inputs = MagicMock()
+        sched.maybe_send_health_check_signal = MagicMock()
+        streamer = MagicMock()
+
+        def stream_output(reqs, return_logprob):
+            for req in reqs:
+                if req.finished():
+                    req.finished_output = True
+
+        streamer.stream_output.side_effect = stream_output
+        sched.batch_result_processor = SchedulerBatchResultProcessor(
+            is_generation=True,
+            disaggregation_mode=DisaggregationMode.DECODE,
+            enable_overlap=True,
+            enable_overlap_mlx=False,
+            model_config=SimpleNamespace(self_opened_think_start_ids=None),
+            token_to_kv_pool_allocator=allocator,
+            tree_cache=tree,
+            hisparse_coordinator=None,
+            req_to_token_pool=pool,
+            decode_offload_manager=None,
+            metrics_collector=MagicMock(),
+            metrics_reporter=sched.metrics_reporter,
+            draft_worker=None,
+            model_worker=MagicMock(),
+            logprob_result_processor=None,
+            output_streamer=streamer,
+            beam_coordinator=None,
+            abort_request=MagicMock(),
+        )
+        return sched
+
+    def add_request(self, sched, msg):
+        if sched.dp_admission is not None:
+            sched.dp_admission.acknowledge(msg)
+        msg.sampling_params.normalize(None)
+        req = sched._create_generation_req(
+            msg, msg.rid, "", msg.input_ids, msg.sampling_params
+        )
+        req.kv.req_pool_idx = len(sched.running_batch.reqs)
+        req.kv.kv_committed_len = len(msg.input_ids)
+        req.kv.kv_allocated_len = 128
+        self.used_tokens += 128
+        sched.running_batch.reqs.append(req)
+        return req
+
+    def process(self, sched, reqs=None):
+        if reqs is None:
+            reqs = sched.running_batch.reqs
+        batch = SimpleNamespace(
+            reqs=reqs,
+            forward_mode=ForwardMode.DECODE,
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            batch_size=lambda: len(reqs),
+            return_logprob=False,
+            mamba_track_mask_cpu=None,
+            has_grammar=False,
+        )
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([7] * (6 * len(reqs))),
+            accept_lens=torch.tensor([6] * len(reqs)),
+            speculative_num_draft_tokens=6,
+        )
+        sched.process_batch_result(batch, result)
+
+    def full_scheduler_and_queue(self):
+        ctl = self.controller(queue_size=64)
+        sched = self.scheduler()
+        sched.publish_load_snapshot(force=True)
+        ctl.load_snapshot_reader.read_all.side_effect = lambda: [self.published[-1]]
+        for rid, output in (("finishing", 6), ("continuing", 100)):
+            ctl._request_dispatcher(request(rid, output=output))
+            self.add_request(sched, self.recv(self.receivers[0]))
+        sched.publish_load_snapshot(force=True)
+        self.now = 1.1
+        ctl._request_dispatcher(request("queued", output=100))
+        self.assertEqual(len(ctl.dp_admission.queue), 1)
+        self.published.clear()
+        # Keep the last published snapshot accessible while the next iteration
+        # has not produced a fresh one yet.
+        last = sched.load_snapshot_writer.write.call_args.args[0]
+        ctl.load_snapshot_reader.read_all.side_effect = lambda: [
+            self.published[-1] if self.published else last
+        ]
+        return sched, ctl
+
+    def test_eagle_completion_publishes_after_group_free_and_wakes_queue(self):
+        sched, ctl = self.full_scheduler_and_queue()
+
+        def before_free():
+            # A separate /v1/loads read retires the ownership entry before the
+            # writer gets a turn, but its release notification must survive.
+            observed = sched.load_inquirer.get_loads()
+            self.assertEqual(observed.dp_admission_reserved_requests, 1)
+            self.assertEqual(observed.dp_admission_reserved_tokens, 768)
+            self.assertEqual(observed.num_running_reqs, 1)
+            self.assertEqual(len(self.published), 0)
+            self.assertEqual(self.used_tokens, 256)
+
+        self.before_free_group_end = before_free
+        self.process(sched)
+        self.assertEqual(len(self.published), 1)
+        load = self.published[-1]
+        self.assertEqual(load.dp_admission_reserved_tokens, 640)
+        self.assertEqual(load.dp_admission_reserved_requests, 1)
+        self.assertEqual(load.num_running_reqs, 1)
+        self.assertEqual(load.dp_admission_sequence, 2)
+        self.assertEqual(load.dp_admission_epoch, "test")
+        self.assertEqual(len(sched.running_batch.reqs), 2)  # Not filtered yet.
+        self.now = 1.2
+        ctl.poll_dp_admission()
+        sent = self.recv(self.receivers[0])
+        self.assertEqual((sent.rid, sent.dp_admission_sequence), ("queued", 3))
+        self.assertEqual(ctl.dp_admission.ranks[0].total_requests, 2)
+        self.assertEqual(len(ctl.dp_admission.queue), 0)
+
+    def test_allocator_floor_drop_publishes_without_another_completion(self):
+        sched, ctl = self.full_scheduler_and_queue()
+        self.defer_allocator_free = True
+        self.process(sched)
+        self.assertEqual(self.published[-1].dp_admission_reserved_tokens, 768)
+        self.now = 1.2
+        ctl.poll_dp_admission()
+        self.assertEqual(len(ctl.dp_admission.queue), 1)
+        with self.assertRaises(zmq.Again):
+            self.recv(self.receivers[0])
+        self.used_tokens -= self.pending_free_tokens
+        self.pending_free_tokens = 0
+        self.defer_allocator_free = False
+        self.process(sched, [sched.running_batch.reqs[1]])
+        self.assertEqual(len(self.published), 2)
+        self.assertEqual(self.published[-1].dp_admission_reserved_tokens, 640)
+        self.now = 1.3
+        ctl.poll_dp_admission()
+        self.assertEqual(self.recv(self.receivers[0]).rid, "queued")
+
+    def test_multiple_completions_coalesce_and_ordinary_decode_stays_throttled(self):
+        sched = self.scheduler(capacity=4096, slots=4)
+        for sequence, output in enumerate((6, 6, 1000), 1):
+            self.add_request(
+                sched,
+                request(
+                    str(sequence),
+                    output=output,
+                    dp_admission_epoch="test",
+                    dp_admission_sequence=sequence,
+                    dp_admission_tokens=640 if output == 6 else 1152,
+                ),
+            )
+        sched.publish_load_snapshot(force=True)
+        self.published.clear()
+        self.process(sched)
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(sched.dp_admission.num_released_requests, 2)
+        self.assertEqual(self.published[-1].dp_admission_reserved_requests, 1)
+        survivor = sched.running_batch.reqs[2]
+        for _ in range(14):
+            # Growing live KV is covered by its existing commitment and must
+            # not turn the release notification into per-token publication.
+            allocated = (survivor.kv.kv_committed_len + 6 + 63) // 64 * 64
+            self.used_tokens += allocated - survivor.kv.kv_allocated_len
+            survivor.kv.kv_allocated_len = allocated
+            self.process(sched, [survivor])
+        self.assertEqual(len(self.published), 1)
+        self.process(sched, [survivor])
+        self.assertEqual(len(self.published), 2)
+
+    def test_failed_release_publication_retries_without_losing_notification(self):
+        sched, _ = self.full_scheduler_and_queue()
+        writer = sched.load_snapshot_writer
+        writer.write.side_effect = OSError("temporarily unavailable")
+        self.process(sched)
+        self.assertEqual(len(self.published), 0)
+        writer.write.side_effect = self.published.append
+        self.process(sched, [sched.running_batch.reqs[1]])
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(self.published[-1].dp_admission_reserved_requests, 1)
+
+    def test_new_binding_cannot_hide_an_equal_cost_completion(self):
+        sched = self.scheduler()
+        for sequence, output in ((1, 6), (2, 100)):
+            self.add_request(
+                sched,
+                request(
+                    str(sequence),
+                    output=output,
+                    dp_admission_epoch="test",
+                    dp_admission_sequence=sequence,
+                    dp_admission_tokens=640,
+                ),
+            )
+            if sequence == 1:
+                sched.publish_load_snapshot(force=True)
+        self.published.clear()
+        # One newly acknowledged commitment replaces one completed commitment.
+        # The aggregate tokens/slots match the old snapshot, but that snapshot
+        # plus the controller's unacknowledged dispatch still overstates load.
+        self.process(sched)
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(self.published[-1].dp_admission_reserved_tokens, 640)
+        self.assertEqual(self.published[-1].dp_admission_reserved_requests, 1)
+        self.assertEqual(self.published[-1].dp_admission_sequence, 2)
+
+    def test_zmq_backpressure_does_not_acknowledge_release_publication(self):
+        sched, _ = self.full_scheduler_and_queue()
+        writer = ZmqLoadSnapshotWriter.__new__(ZmqLoadSnapshotWriter)
+        writer.dp_rank = 0
+        writer.publish_counter = 0
+        writer.publish_interval = 15
+        writer._zmq = zmq
+        writer._socket = MagicMock()
+        writer._socket.send.side_effect = zmq.Again()
+        sched.load_snapshot_writer = writer
+        self.process(sched)
+        self.assertEqual(writer._socket.send.call_count, 1)
+        self.assertEqual(sched._last_published_dp_admission, (0, 1280))
+        writer._socket.send.side_effect = None
+        self.process(sched, [sched.running_batch.reqs[1]])
+        self.assertEqual(writer._socket.send.call_count, 2)
+        load = snapshot_decoder.decode(writer._socket.send.call_args.args[0])
+        self.assertEqual(load.dp_admission_sequence, 2)
+        self.assertEqual(load.dp_admission_reserved_tokens, 640)
+        self.assertEqual(sched._last_published_dp_admission, (1, 640))
+
+    def test_mooncake_deferred_ownership_is_not_refunded_until_drain(self):
+        sched, ctl = self.full_scheduler_and_queue()
+        held, continuing = sched.running_batch.reqs
+        held.finished_output = True
+        held.bootstrap_room = 42
+        # Even a stale running-list reference cannot hide held KV ownership.
+        self.assertEqual(sched.load_inquirer.get_loads().num_running_reqs, 2)
+        sched.running_batch.reqs = [continuing]
+        queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        queue.scheduler = sched
+        sched.enable_hisparse = False
+        sched.metrics_reporter.enable_metrics = False
+        queue.queue = []
+        queue.tree_cache = sched.tree_cache
+        queue.enable_staging = queue.enable_host_receive = False
+        queue.metadata_buffers = MagicMock()
+        queue.req_to_metadata_buffer_idx_allocator = MagicMock()
+        queue.gloo_group = None
+        receiver = MagicMock()
+        receiver.kv_mgr.is_abort_release_safe.return_value = False
+        decode_req = DecodeRequest(held, receiver)
+        queue._deferred_releases = [(decode_req, 0.0, float("inf"), 3, 1)]
+        sched.disagg_decode_transfer_queue = queue
+        with patch(
+            "sglang.srt.disaggregation.decode.all_reduce_flags",
+            side_effect=lambda flags, **kwargs: flags,
+        ):
+            queue.resolve_deferred_releases()
+            self.process(sched)
+            self.assertTrue(held.kv.holds_kv)
+            self.assertEqual(len(self.published), 0)
+            self.assertEqual(sched.dp_admission.num_released_requests, 0)
+            self.now = 1.2
+            ctl.poll_dp_admission()
+            self.assertEqual(len(ctl.dp_admission.queue), 1)
+            with self.assertRaises(zmq.Again):
+                self.recv(self.receivers[0])
+            receiver.kv_mgr.is_abort_release_safe.return_value = True
+            queue.resolve_deferred_releases()
+        self.assertFalse(held.kv.holds_kv)
+        self.assertIsNone(decode_req.kv_receiver)
+        self.process(sched)
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(self.published[-1].dp_admission_reserved_tokens, 640)
+        self.now = 1.3
+        ctl.poll_dp_admission()
+        self.assertEqual(self.recv(self.receivers[0]).rid, "queued")
+
+    def test_default_off_preserves_snapshot_timing_and_public_fields(self):
+        sched = self.scheduler(enabled=False)
+        req = self.add_request(sched, request(output=6))
+        sched.load_snapshot_writer.publish_counter = 14
+        self.process(sched)
+        self.assertEqual(len(self.published), 1)
+        self.assertEqual(self.published[0].num_running_reqs, 1)
+        self.assertEqual(self.published[0].num_used_tokens, 128)
+        self.assertFalse(req.kv.holds_kv)
+        self.assertFalse(
+            any(key.startswith("dp_admission_") for key in self.published[0].to_dict())
+        )
+        # Even a direct read retains the pre-existing raw running-list count.
+        self.assertEqual(sched.load_inquirer.get_loads().num_running_reqs, 1)
 
 
 class TestSchedulerAdmissionRelease(unittest.TestCase):

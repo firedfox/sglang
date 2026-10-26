@@ -288,6 +288,10 @@ class SchedulerDPAdmission:
         self.max_new_tokens_limit = max_new_tokens_limit or 0
         self.sequence = 0
         self.live: dict[int, _LiveReservation] = {}
+        # A monotonic, local change counter. A /v1/loads read may retire an
+        # entry before the next shared-memory publication, so the writer must
+        # not rely on noticing the removal in its own snapshot() call.
+        self.num_released_requests = 0
 
     def acknowledge(self, tokenized_request: Any) -> None:
         sequence = tokenized_request.dp_admission_sequence
@@ -323,6 +327,7 @@ class SchedulerDPAdmission:
             )
             if terminal and not owns_resources:
                 del self.live[key]
+                self.num_released_requests += 1
                 continue
             reserved_tokens += entry.tokens
             if kv.holds_kv:

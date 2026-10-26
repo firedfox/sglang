@@ -883,18 +883,55 @@ class Scheduler(
         writer = self.load_snapshot_writer
         if writer is None:
             return None
-        if not force:
-            writer.publish_counter += 1
-            if writer.publish_counter < writer.publish_interval:
-                return None
-        writer.publish_counter = 0
         try:
+            admission = getattr(self, "dp_admission", None)
+            if admission is not None and not force:
+                # Check only the local ledger and allocator, not all serving
+                # queues, on ordinary decode iterations. Finished output alone
+                # never releases a commitment; snapshot() requires ownership to
+                # be gone and retains any still-used allocator tokens as a floor.
+                num_used, _ = (
+                    self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
+                )
+                current = admission.snapshot(num_used)
+                released, tokens = getattr(
+                    self, "_last_published_dp_admission", (0, None)
+                )
+                force = admission.num_released_requests != released or (
+                    tokens is not None
+                    and current["dp_admission_reserved_tokens"] < tokens
+                )
+            if not force:
+                writer.publish_counter += 1
+                if writer.publish_counter < writer.publish_interval:
+                    return None
+            writer.publish_counter = 0
             load = self.load_inquirer.get_loads()
-            writer.write(load)
+            written = writer.write(load)
+            if admission is not None and written is False:
+                return None
+            if admission is not None:
+                # A failed write must leave the release pending for the next
+                # iteration. One successful write coalesces every release in
+                # this batch, even when new admissions hide the net decrease.
+                self._last_published_dp_admission = (
+                    admission.num_released_requests,
+                    load.dp_admission_reserved_tokens,
+                )
             return load
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
             return None
+
+    def _publish_batch_load(self, batch: ScheduleBatch) -> None:
+        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Router-facing gauge on the dedicated PUB socket, reusing the
+        # snapshot above rather than walking the queues again.
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads,
+            force=batch.forward_mode.is_extend(),
+            snapshot=snapshot,
+        )
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -5161,14 +5198,9 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing gauge on the dedicated PUB socket, reusing the
-        # snapshot above rather than walking the queues again.
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
-            snapshot=snapshot,
-        )
+        admission_enabled = getattr(self, "dp_admission", None) is not None
+        if not admission_enabled:
+            self._publish_batch_load(batch)
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -5186,6 +5218,12 @@ class Scheduler(
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
+
+        if admission_enabled:
+            # Result processing has now streamed terminal outputs and completed
+            # allocator free_group_end(). Publish newly available admission
+            # capacity once, rather than waiting another decode interval.
+            self._publish_batch_load(batch)
 
         self._record_step_counters(batch, result)
 
