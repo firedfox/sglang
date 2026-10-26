@@ -39,6 +39,17 @@ def ib_devices(value):
     return ",".join(devices)
 
 
+def json_object(value):
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError) as error:
+        raise argparse.ArgumentTypeError(f"must be a JSON object: {error}") from error
+    if not isinstance(parsed, dict):
+        raise argparse.ArgumentTypeError("must be a JSON object")
+    # The runtime validates the policy's coefficients before model loading.
+    return value
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         description="GLM-5.3 HTTP PD baseline: JSON dry-run unless --run is given.",
@@ -103,6 +114,12 @@ def build_parser():
                     "--enable-dp-admission",
                     action="store_true",
                     help="Opt in to per-rank slot and full-generation KV reservations",
+                )
+            else:
+                role_parser.add_argument(
+                    "--hicache-storage-prefetch-cost-model",
+                    type=json_object,
+                    help="Opt in to cost_aware L3 prefetch with calibrated JSON rates",
                 )
     return parser
 
@@ -291,13 +308,24 @@ def worker_command(args):
                 "--hicache-storage-backend",
                 "mooncake",
                 "--hicache-storage-prefetch-policy",
-                "timeout",
+                (
+                    "cost_aware"
+                    if args.hicache_storage_prefetch_cost_model is not None
+                    else "timeout"
+                ),
                 "--deepep-mode",
                 "normal",
                 "--deepep-config",
                 '{"normal_dispatch":{"num_sms":64},"normal_combine":{"num_sms":64}}',
             ]
         )
+        if args.hicache_storage_prefetch_cost_model is not None:
+            argv.extend(
+                [
+                    "--hicache-storage-prefetch-cost-model",
+                    args.hicache_storage_prefetch_cost_model,
+                ]
+            )
     else:
         argv.extend(
             [

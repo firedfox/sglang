@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.prefetch_cost import PrefetchCostModel
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -183,6 +184,11 @@ class _StoragePrefetchWait(msgspec.Struct):
     timer: PollTimer = msgspec.field(default_factory=PollTimer)
     timeout_s: float = 0.0
     expired: bool = False
+    stop_reason: str = "deadline"
+    progress_timer: PollTimer = msgspec.field(default_factory=PollTimer)
+    progress_operation_id: int = -1
+    progress_span: tuple[int, int] = (0, 0)
+    progress_start_tokens: int = 0
 
 
 class _OngoingPrefetch(NamedTuple):
@@ -316,6 +322,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
+        self.prefetch_cost_model: Optional[PrefetchCostModel] = None
         self.hicache_storage_pass_prefix_keys = False
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
@@ -341,6 +348,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_unservable_prefix": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
+            "stopped_cost_aware": 0,
+            "stopped_deadline": 0,
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
@@ -575,6 +584,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self.prefetch_cost_model = PrefetchCostModel.from_json(
+            get_memory().hicache_storage_prefetch_cost_model
+        )
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -2251,7 +2263,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
         if (
-            self.prefetch_stop_policy == "timeout"
+            self.prefetch_stop_policy in ("timeout", "cost_aware")
             and operation.handle not in self._storage_prefetch_wait
         ):
             # Start at the first blocked admission poll; refetches keep this budget.
@@ -2262,6 +2274,65 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             wait.timer.observe(ready=False)
             self._storage_prefetch_wait[operation.handle] = wait
+
+        if self.prefetch_stop_policy == "cost_aware":
+            wait = self._storage_prefetch_wait[operation.handle]
+            self._observe_prefetch_progress(operation, wait)
+
+    def _observe_prefetch_progress(
+        self, operation: PrefetchOperation, wait: _StoragePrefetchWait
+    ) -> None:
+        if operation.host_indices is None or not operation.hash_value:
+            return
+        span = (operation.storage_start, len(operation.hash_value) * self.page_size)
+        if wait.progress_operation_id != operation.id or wait.progress_span != span:
+            # Refetches and device-prefix trims change what progress means. Start
+            # a fresh sample, but retain the original request's timeout budget.
+            wait.progress_operation_id = operation.id
+            wait.progress_span = span
+            wait.progress_start_tokens = operation.completed_tokens
+            wait.progress_timer = PollTimer()
+            wait.progress_timer.observe(ready=False)
+
+    def _prefetch_cost_exceeds_recompute(self, operation: PrefetchOperation) -> bool:
+        model = self.prefetch_cost_model
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        expected_tokens = len(operation.hash_value) * self.page_size
+        if (
+            model is None
+            or wait is None
+            or operation.host_indices is None
+            or operation.completed_tokens >= expected_tokens
+        ):
+            # Unknown query results have no reliable remaining read size. When
+            # KV has already landed, only sidecars remain and cancellation would
+            # discard useful work without an estimate for those separate pools.
+            return False
+
+        self._observe_prefetch_progress(operation, wait)
+        remaining_tokens = expected_tokens - operation.completed_tokens
+        # SWA/Mamba and other independent pools are all-or-nothing. Their
+        # partial KV prefix cannot be credited as retained recomputation work.
+        all_or_nothing = any(
+            transfer.indices_from_pool != PoolName.KV
+            for transfer in operation.pool_transfers or ()
+        )
+        recompute_tokens = remaining_tokens
+        if all_or_nothing:
+            # A buffer-mode FULL-head trim can leave device KV whose independent
+            # state is still missing. That head is not a jointly reusable prefix
+            # on cancellation, so include the original sidecar span as well.
+            recompute_tokens = max(
+                expected_tokens,
+                len(operation.sidecar_hash_values or ()) * self.page_size,
+            )
+        estimate = model.estimate(
+            remaining_tokens=remaining_tokens,
+            recompute_tokens=recompute_tokens,
+            observed_tokens=operation.completed_tokens - wait.progress_start_tokens,
+            observation_seconds=wait.progress_timer.elapsed(),
+        )
+        return estimate is not None and estimate.should_cancel
 
     def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
         if operation.host_indices is not None and (
@@ -2280,9 +2351,21 @@ class UnifiedRadixCache(BasePrefixCache):
         self.storage_prefetch_retries.cancel(operation.handle.rid)
         # Only a rank-agreed verdict can suppress retries, including on peers
         # that have not reached their conditional admission poll yet.
-        self._storage_prefetch_wait.setdefault(
+        wait = self._storage_prefetch_wait.setdefault(
             operation.handle, _StoragePrefetchWait()
-        ).expired = True
+        )
+        if not wait.expired:
+            counter = f"stopped_{wait.stop_reason}"
+            self._prefetch_outcome_stats[counter] = (
+                self._prefetch_outcome_stats.get(counter, 0) + 1
+            )
+        wait.expired = True
+
+    def _prefetch_stop_reason(self, operation: PrefetchOperation) -> str:
+        if not operation.deadline_expired:
+            return "storage_transfer"
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        return wait.stop_reason if wait is not None else "deadline"
 
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
@@ -2292,17 +2375,37 @@ class UnifiedRadixCache(BasePrefixCache):
             # Completion is committed by the ACK drain (sync-thread MIN-reduced
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
-        if self.prefetch_stop_policy == "timeout":
+        if self.prefetch_stop_policy in ("timeout", "cost_aware"):
             # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
-            should_terminate = False
+            # rank stops) and _all_reduce broadcasts the verdict along PP.
+            # 0 = keep waiting, 1 = cost, 2 = deadline; a deadline wins ties.
+            stop_reason = 0
             if self.pp_rank == 0:
-                should_terminate = self._prefetch_deadline_expired(operation)
+                wait = self._storage_prefetch_wait.get(operation.handle)
+                if wait is not None and wait.expired:
+                    # Keep the first agreed reason while cancellation ACKs drain;
+                    # a later wall-clock timeout must not relabel a cost stop.
+                    stop_reason = 1 if wait.stop_reason == "cost_aware" else 2
+                elif self._prefetch_deadline_expired(operation):
+                    stop_reason = 2
+                elif (
+                    self.prefetch_stop_policy == "cost_aware"
+                    and self._prefetch_cost_exceeds_recompute(operation)
+                ):
+                    stop_reason = 1
             should_terminate_tensor = torch.tensor(
-                int(should_terminate), dtype=torch.int, device="cpu"
+                stop_reason, dtype=torch.int, device="cpu"
             )
             self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            stop_reason = should_terminate_tensor.item()
+            if stop_reason:
+                # Adopt the reason even when this rank has no local timer yet.
+                wait = self._storage_prefetch_wait.setdefault(
+                    operation.handle, _StoragePrefetchWait()
+                )
+                if not wait.expired:
+                    wait.stop_reason = "cost_aware" if stop_reason == 1 else "deadline"
+            return stop_reason != 0
         return True
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
@@ -2398,13 +2501,15 @@ class UnifiedRadixCache(BasePrefixCache):
             if not self._can_terminate_prefetch(operation):
                 self._start_storage_prefetch_wait(operation)
                 return False
-            if self.prefetch_stop_policy == "timeout":
+            if self.prefetch_stop_policy in ("timeout", "cost_aware"):
                 self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
             if operation.deadline_expired:
-                self._finish_storage_prefetch(request, 0, reason="deadline")
+                self._finish_storage_prefetch(
+                    request, 0, reason=self._prefetch_stop_reason(operation)
+                )
             else:
                 self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
@@ -2446,7 +2551,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="deadline" if operation.deadline_expired else "storage_transfer",
+                reason=self._prefetch_stop_reason(operation),
             )
         if (
             completed_tokens > 0
@@ -2609,7 +2714,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            reason = "deadline" if operation.deadline_expired else "storage_transfer"
+            reason = self._prefetch_stop_reason(operation)
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
@@ -3167,7 +3272,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     if hit_tokens > 0:
                         reason = None
                         if operation.deadline_expired:
-                            reason = "deadline"
+                            reason = self._prefetch_stop_reason(operation)
                         elif hit_tokens < self.prefetch_threshold:
                             reason = "below_threshold"
                         self._finish_storage_prefetch(

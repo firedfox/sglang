@@ -75,6 +75,7 @@ existing deployment addresses and selectors:
 | `--max-concurrent-requests` | Router | `256` HTTP requests per Router process |
 | `--all-cp-ranks-transfer` | P, D | Explicit experimental opt-in; see below |
 | `--enable-dp-admission` | D | Explicit per-rank request and full-generation KV reservations; off by default |
+| `--hicache-storage-prefetch-cost-model` | P | Calibrated JSON; explicitly selects `cost_aware` instead of the default `timeout` |
 
 The Router selects pods using `rbg.workloads.x-k8s.io/role-name=prefill` or
 `decode`, together with `rbg.workloads.x-k8s.io/group-name=GROUP`. Its service
@@ -172,6 +173,38 @@ inputs, beam search, LoRA, adaptive speculation, role switching, and hybrid or
 offloaded KV layouts are outside the initial contract. See the
 [PD admission documentation](../../../docs/docs/advanced_features/pd_disaggregation.mdx#decode-dp-admission)
 for the full scope.
+
+### L3 read cost versus recomputation
+
+Keep the default `timeout` policy until you have calibrated storage and
+recomputation costs. To opt in with your own calibration file:
+
+```bash
+python3 examples/runtime/glm53_pd/launch.py prefill \
+  --hicache-storage-prefetch-cost-model "$(cat /etc/sglang/prefetch-cost.json)"
+```
+
+The launcher passes the JSON directly as one argument and selects `cost_aware`.
+It checks JSON object syntax; the runtime validates all coefficients before
+model loading. The model requires `recompute_tokens_per_second`; it optionally
+accepts `read_tokens_per_second`, `min_observation_seconds`, `cancel_margin`,
+and `recompute_fixed_seconds`. The
+[HiCache cost model reference](../../../docs/docs/advanced_features/hicache_best_practices.mdx#cost-aware-prefetch)
+defines units, defaults, and bounds. No throughput estimate is supplied by this
+example.
+
+Cost-based stopping compares remaining read time with recomputing the unusable
+prefix. Observed progress can replace the configured read rate. Without a usable
+estimate it falls back to the existing timeout policy. It retains the cross-rank
+stop decision, sticky cancellation, retry suppression, and sidecar cleanup.
+The initial agreed stop reason stays `cost_aware` through later cancellation
+polls. Monitor `sglang:storage_prefetch_unfulfilled_tokens_total{reason="cost_aware"}`
+alongside useful cached tokens and TTFT; cancellation is not a storage miss.
+
+Calibration must describe logical tokens for the actual model, context-length
+range, and complete TP/CP cache group. A rate measured for another model or
+divided by CP8 again can produce the wrong decision. Validate cold/L2/L3 cases
+and mixed prompt lengths before enabling this opt-in in production.
 
 ### Optional all-CP-rank transfer experiment
 

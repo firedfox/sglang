@@ -179,6 +179,23 @@ class TestGLM53PDLaunch(unittest.TestCase):
             "prefill", "--model-path", "/models/glm53", "--enable-dp-admission"
         )
 
+    def test_l3_cost_model_is_an_explicit_prefill_only_opt_in(self):
+        flag = "--hicache-storage-prefetch-cost-model"
+        model = '{"recompute_tokens_per_second":12345,"read_tokens_per_second":54321}'
+        plan = self.plan("prefill", "--model-path", "/models/glm53", flag, model)
+        self.assertEqual(
+            self.value(plan, "--hicache-storage-prefetch-policy"), "cost_aware"
+        )
+        self.assertEqual(self.value(plan, flag), model)
+        self.assertEqual(plan["argv"].count(flag), 1)
+        self.assertEqual(plan["argv"].count("--hicache-storage-prefetch-policy"), 1)
+        for invalid in ("not-json", "[]", "1", "null"):
+            self.assert_invalid(
+                "prefill", "--model-path", "/models/glm53", flag, invalid
+            )
+        self.assert_invalid("decode", "--model-path", "/models/glm53", flag, model)
+        self.assert_invalid("router", flag, model)
+
     def test_worker_model_path_is_required(self):
         for role in ("prefill", "decode"):
             with self.subTest(role=role):

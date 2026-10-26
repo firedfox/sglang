@@ -15,6 +15,37 @@ from sglang.srt.arg_groups.overrides import (
 logger = logging.getLogger(__name__)
 
 
+def validate_hicache_prefetch_cost_model(server_args: Any) -> None:
+    """Validate calibration before model loading, including dummy launches."""
+    from sglang.srt.mem_cache.prefetch_cost import PrefetchCostModel
+
+    cfg = resolving_view(server_args)
+    model = PrefetchCostModel.from_json(cfg.hicache_storage_prefetch_cost_model)
+    if cfg.hicache_storage_prefetch_policy != "cost_aware":
+        return
+    if (
+        not cfg.enable_hierarchical_cache
+        or cfg.disable_radix_cache
+        or cfg.radix_cache_backend is not None
+        or cfg.enable_unified_cache_external_linker
+    ):
+        raise ValueError(
+            "--hicache-storage-prefetch-policy cost_aware requires "
+            "--enable-hierarchical-cache with the default UnifiedRadixCache "
+            "and radix caching enabled."
+        )
+    if cfg.pp_size > 1 and cfg.hicache_host_memory_mode == "buffer_only":
+        raise ValueError(
+            "--hicache-storage-prefetch-policy cost_aware does not support "
+            "PP buffer_only prefetch tickets, which bypass admission stop policies."
+        )
+    if model is None:
+        logger.warning(
+            "cost_aware has no --hicache-storage-prefetch-cost-model; "
+            "L3 prefetch uses the timeout policy."
+        )
+
+
 def handle_hicache(server_args: Any):
     """Normalize hicache-related knobs into a valid runtime configuration.
 
