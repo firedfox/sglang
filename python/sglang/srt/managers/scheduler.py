@@ -273,6 +273,10 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.scheduler_components.prefill_time_budget import (
+    PrefillTimeBudget,
+    PrefillTimeModel,
+)
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -1375,6 +1379,16 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
+        self.prefill_time_model = PrefillTimeModel.from_json(
+            get_schedule().prefill_time_model
+        )
+        if (
+            get_schedule().prefill_time_budget_ms is not None
+            and self.chunked_prefill_size is None
+        ):
+            raise ValueError(
+                "--prefill-time-budget-ms requires enabled chunked prefill."
+            )
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
@@ -1808,6 +1822,21 @@ class Scheduler(
         longer than the chunk would wait in the queue forever."""
         align = self.truncation_align_size
         chunk = self.chunked_prefill_size
+        if getattr(self, "prefill_time_model", None) is not None:
+            shard_page = (
+                self.token_to_kv_pool_allocator.page_size
+                if getattr(self, "kv_shard_widening", 1) > 1
+                else 1
+            )
+            minimum_chunk = math.lcm(self.page_size, align or 1, shard_page)
+            hard_limit = min(chunk, self.max_prefill_tokens)
+            if hard_limit < minimum_chunk:
+                raise ValueError(
+                    "--prefill-time-budget-ms needs --chunked-prefill-size and "
+                    "--max-prefill-tokens to each fit a minimum aligned chunk "
+                    f"on every attention group ({minimum_chunk} tokens; "
+                    f"resolved limit {hard_limit})."
+                )
         if align is None or chunk is None or chunk >= align:
             return
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -4219,6 +4248,14 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prefill_time_budget=(
+                PrefillTimeBudget(
+                    self.prefill_time_model, get_schedule().prefill_time_budget_ms
+                )
+                if get_schedule().prefill_time_budget_ms is not None
+                else None
+            ),
+            truncation_align_size=self.truncation_align_size,
         )
 
         if self.chunked_req is not None:

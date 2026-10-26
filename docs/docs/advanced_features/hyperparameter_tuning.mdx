@@ -64,6 +64,87 @@ If you encounter out-of-memory (OOM) errors, you can adjust the following parame
 - If OOM occurs during decoding, try lowering `--max-running-requests`.
 - You can also reduce `--mem-fraction-static` to a smaller value, such as 0.8 or 0.7. This decreases the memory usage of the KV cache memory pool and helps prevent OOM errors during both prefill and decoding. However, it limits maximum concurrency and reduces peak throughput.
 
+### Estimated prefill time budget
+
+For chunked text prefill with pipeline size one, you can opt in to an estimated
+per-batch time budget using `--prefill-time-budget-ms` together with
+`--prefill-time-model`. Both are disabled by default and must be supplied
+together. Calibrate the model on the GPU hardware, model revision, quantization,
+speculation settings, and TP/CP layout that you will use. Do not substitute
+request TTFT for GPU prefill execution time: TTFT also includes queueing,
+tokenization, cache waits, transfer, and other work.
+
+The model uses the cached prefix length `h` and newly processed length `x` for
+each request:
+
+```text
+batch_time_ms = fixed_ms
+              + sum(linear_ms_per_token * x
+                    + quadratic_ms_per_token2 * (2*h*x + x*x))
+```
+
+`fixed_ms` is charged once per batch. Lengths are the full logical lengths for
+the TP/CP group, including the real prefix of a continuing chunk. Do not divide
+them by CP size again. The model does not use rank-local wall-clock feedback or
+add a distributed collective, so equal request shapes and coefficients produce
+equal admission decisions across ranks.
+
+The following JSON demonstrates the schema only; these numbers are **not
+calibrated recommendations**:
+
+```json
+{
+  "fixed_ms": 0.2,
+  "linear_ms_per_token": 0.001,
+  "quadratic_ms_per_token2": 0.00000001
+}
+```
+
+Each omitted coefficient defaults to zero. All coefficients must be finite and
+nonnegative, and at least one token coefficient must be positive. The budget
+must be finite and positive. Unknown JSON fields and incomplete budget/model
+pairs fail validation before model loading.
+
+Add the paired options to an existing compatible Prefill command, using your
+own calibrated file and selected budget:
+
+```bash
+--prefill-time-budget-ms "$PREFILL_BUDGET_MS" \
+--prefill-time-model "$(cat /etc/sglang/prefill-time-model.json)"
+```
+
+The scheduler limits candidate chunks without spending the time budget during
+selection. It charges the final admitted shape after cache handling and commit.
+For ordinary cache-mode host load-back, it determines the final logical prefix
+from the matched path before submitting H2D work, so selection uses the restored
+prefix for both cost and alignment. It does not reject a successful transfer
+afterwards and invalidate its destination. A load that returns zero FULL tokens
+is reselected against the actual prefix. A rejected or reselected candidate does
+not consume the estimate. Continuations and `ignore_eos` requests follow the same
+budget, and only one unfinished chunk owner is allowed at a time.
+
+This is a soft scheduling estimate. The existing chunk, prefill token, memory,
+and alignment limits remain authoritative. If the time budget is too small to
+make progress, an empty batch can admit one minimum legal chunk and report that
+the estimate was exceeded. That exception does not bypass the existing limits.
+Smaller chunks can also increase scheduling and kernel overhead; a lower budget
+is not automatically faster.
+
+The initial implementation rejects pipeline parallelism, mixed prefill/decode
+chunks, dynamic chunking, dLLM, Decode mode, embedding mode, disabled chunking,
+bounded encoder SWA replay, and `--enable-streaming-session`. Streaming sessions
+can reuse prefixes that do not meet the intermediate chunk alignment contract.
+GPU startup, output correctness, representative mixed-length workloads, and CP
+consistency still need deployment validation.
+
+For calibration, collect per-batch prefix lengths, extend lengths, and GPU
+execution durations, then fit nonnegative coefficients and check prediction
+error on held-out context lengths and batch mixes. The quadratic term requires
+both `sum(x*x)` and `sum(h*x)`; total prompt tokens alone are insufficient for
+mixed batches. Default request-level OTLP traces and benchmark TTFT do not
+provide this full calibration dataset. Profile a small representative sample,
+then run performance comparisons with detailed profiling disabled.
+
 ### Tune `--cuda-graph-max-bs-decode`
 By default, CUDA graph is enabled only for small batch sizes (e.g., less than 160 or 256).
 However, for some models, especially at large tensor parallelism sizes, CUDA graph can be useful for batch sizes up to 512 or 768.

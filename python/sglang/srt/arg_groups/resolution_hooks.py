@@ -23,6 +23,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "validate_hicache_prefetch_cost_model",
         "handle_offload_compatibility",
         "validate_prefill_decode_interval",
+        "validate_prefill_time_budget",
         "default_unset_prefill_decode_interval",
         "validate_response_store",
         "validate_sampling_mask_max_tokens",

@@ -89,11 +89,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_prefill_time_budget,
         validate_response_store,
         validate_sampling_mask_max_tokens,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
+    run_hook(validate_prefill_time_budget, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
 
@@ -381,5 +383,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Recheck resolved topology, caches, and speculative settings after every
     # declaration, including defaults selected from the model architecture.
     run_hook(validate_dp_admission, server_args)
+
+    # Model capabilities can introduce dLLM/replay or disable chunking late.
+    run_hook(validate_prefill_time_budget, server_args)
 
     server_args._resolution_finished = True

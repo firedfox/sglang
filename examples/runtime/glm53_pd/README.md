@@ -76,6 +76,7 @@ existing deployment addresses and selectors:
 | `--all-cp-ranks-transfer` | P, D | Explicit experimental opt-in; see below |
 | `--enable-dp-admission` | D | Explicit per-rank request and full-generation KV reservations; off by default |
 | `--hicache-storage-prefetch-cost-model` | P | Calibrated JSON; explicitly selects `cost_aware` instead of the default `timeout` |
+| `--prefill-time-budget-ms` and `--prefill-time-model` | P | Paired opt-in for a calibrated per-batch time estimate; both absent by default |
 
 The Router selects pods using `rbg.workloads.x-k8s.io/role-name=prefill` or
 `decode`, together with `rbg.workloads.x-k8s.io/group-name=GROUP`. Its service
@@ -158,6 +159,13 @@ held by transfer or retraction cleanup. This protects a shared Decode engine
 across Gateway replicas; Gateway limits remain useful for limiting CPU and HTTP
 work before the engine's admission decision.
 
+Set realistic `max_new_tokens` or OpenAI output-token limits on client requests.
+When no output limit is supplied, the policy reserves the effective remaining
+context (subject to the server's output limit). Large declared output budgets
+can therefore reduce admitted concurrency even when requests usually stop
+early. This policy trades speculative overcommit for explicit capacity
+guarantees; the 256-request setting is still only an upper bound.
+
 An individually impossible request receives 400, occupied budgets receive 429,
 and unavailable or stale rank capacity receives 503. With zero queue size there
 is no additional Decode admission wait. The Gateway cancels the paired Prefill
@@ -206,6 +214,50 @@ range, and complete TP/CP cache group. A rate measured for another model or
 divided by CP8 again can produce the wrong decision. Validate cold/L2/L3 cases
 and mixed prompt lengths before enabling this opt-in in production.
 
+### Prefill time budget
+
+After collecting batch timing data for this model and TP8/CP8 layout, review a
+Prefill command with the measured budget and model:
+
+```bash
+python3 examples/runtime/glm53_pd/launch.py prefill \
+  --prefill-time-budget-ms "$PREFILL_BUDGET_MS" \
+  --prefill-time-model "$(cat /etc/sglang/prefill-time-model.json)"
+```
+
+Both options are required together. The JSON accepts `fixed_ms`,
+`linear_ms_per_token`, and `quadratic_ms_per_token2`; all coefficients must be
+finite and nonnegative, and at least one token coefficient must be positive.
+The launcher checks the positive finite budget and JSON syntax; the runtime
+checks the model before loading weights. The baseline supplies no timing model.
+
+For a request with cached prefix `h` and newly processed tokens `x`, estimated
+work is `linear_ms_per_token * x + quadratic_ms_per_token2 * (2*h*x + x*x)`.
+The fixed cost is charged once per batch. Use complete cache-group logical
+tokens; do not divide them by CP8. The scheduler caps candidate work before
+admission and charges only the committed request shape, including continuation
+and cache load-back paths. Ordinary cache-mode host load-back determines the
+final logical prefix from the matched path before H2D. Selection therefore uses
+the restored prefix for cost and alignment, and a successful transfer does not
+later lose its destination to a time-budget rejection. A load that returns zero
+FULL tokens is reselected against the actual prefix without double charging.
+
+This is a soft scheduling estimate, not a wall-clock deadline or a TTFT promise.
+The existing chunk, prefill token, memory, and alignment limits still apply.
+An empty batch may admit one minimum legal chunk even when it exceeds the time
+estimate, to avoid starvation; it cannot bypass the original capacity limits.
+The scheduler retains a single unfinished chunk owner. It uses no rank-local
+clock feedback and introduces no extra cross-rank consensus.
+
+The initial mode requires chunked, non-PP text prefill. Decode mode, mixed
+prefill/decode chunks, dynamic chunking, dLLM, embedding mode, and bounded encoder
+SWA replay are rejected. It also rejects `--enable-streaming-session`, whose
+arbitrary reused prefix lengths can conflict with intermediate chunk alignment.
+See the
+[time-budget tuning reference](../../../docs/docs/advanced_features/hyperparameter_tuning.mdx#estimated-prefill-time-budget)
+for calibration and limitations. Enable this separately from L3 cost stopping
+until each policy has its own acceptance result.
+
 ### Optional all-CP-rank transfer experiment
 
 The launcher explicitly sets
@@ -223,6 +275,14 @@ particular sharded KV layouts; the environment switch is not a universal rank
 participation override. See the [PD connection logic](../../../python/sglang/srt/disaggregation/common/conn.py).
 
 ## CPU checks and GPU acceptance
+
+The [validation record](VALIDATION.md) lists the CPU, HTTP, and IPC checks that
+actually ran, together with the remaining environment and GPU limits.
+
+The [GPU acceptance and calibration procedure](GPU_ACCEPTANCE.md) contains
+source-checked benchmark commands, cache replay scenarios, admission and
+cancellation checks, and a profiling path for collecting calibration data.
+These commands have not been run on GLM-5.3 GPUs as part of this change.
 
 The launcher and its tests need no GPU or SGLang installation:
 

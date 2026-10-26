@@ -653,6 +653,54 @@ def validate_standard_mps_server_args(server_args: Any):
         )
 
 
+def validate_prefill_time_budget(server_args: Any) -> None:
+    from sglang.srt.managers.scheduler_components.prefill_time_budget import (
+        PrefillTimeBudget,
+        PrefillTimeModel,
+    )
+
+    cfg = resolving_view(server_args)
+    if cfg.prefill_time_budget_ms is None and cfg.prefill_time_model is None:
+        return
+    if cfg.prefill_time_budget_ms is None or cfg.prefill_time_model is None:
+        raise ValueError(
+            "--prefill-time-budget-ms and --prefill-time-model must be supplied together."
+        )
+    model = PrefillTimeModel.from_json(cfg.prefill_time_model)
+    PrefillTimeBudget(model, cfg.prefill_time_budget_ms)
+    if cfg.pp_size != 1 or cfg.enable_dynamic_chunking:
+        raise ValueError(
+            "--prefill-time-budget-ms requires PP size 1 and does not combine "
+            "with --enable-dynamic-chunking."
+        )
+    if cfg.enable_mixed_chunk or cfg.dllm_algorithm is not None:
+        raise ValueError(
+            "--prefill-time-budget-ms does not support mixed prefill/decode "
+            "batches or dLLM staging."
+        )
+    if cfg.disaggregation_mode == "decode" or cfg.is_embedding:
+        raise ValueError(
+            "--prefill-time-budget-ms supports text prefill, not PD decode or embeddings."
+        )
+    if cfg.enable_encoder_swa_bounded_replay:
+        raise ValueError(
+            "--prefill-time-budget-ms does not model encoder SWA replay rows."
+        )
+    if cfg.enable_streaming_session:
+        # A streaming session can retain a non-page-aligned prefix. There may
+        # then be no chunk length satisfying both attention query alignment and
+        # the absolute KV page boundary, so reject the mode before serving.
+        raise ValueError(
+            "--prefill-time-budget-ms does not support --enable-streaming-session."
+        )
+    if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size <= 0:
+        raise ValueError("--prefill-time-budget-ms requires chunked prefill.")
+    if cfg.max_prefill_tokens <= 0:
+        raise ValueError(
+            "--prefill-time-budget-ms requires positive --max-prefill-tokens."
+        )
+
+
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:

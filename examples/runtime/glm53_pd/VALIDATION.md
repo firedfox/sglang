@@ -1,0 +1,125 @@
+# Validation record for the GLM-5.3 PD development branch
+
+This record covers CPU, HTTP, IPC, and scheduling checks performed while building
+`feature/glm53-pd-optimization-20261026`, based on
+`ef11eb3b76354ffbabd9f17a2343e79522e41cf2`. It is not a GLM-5.3 GPU benchmark or
+a production deployment result. No model weights were loaded for these checks.
+
+## Results
+
+| Area | Result | What the checks establish |
+| --- | --- | --- |
+| Gateway build | Full library and `routing_tests` targets compiled | Rust code and the HTTP integration target compile together |
+| Strict admission | 22 regular unit tests passed | Permit lifetime, zero-refill admission, cancellation, queue capacity, and configuration |
+| Admission wakeup stress | 1 explicit test passed, 200,000 rounds | The zero-refill waiter does not lose the release wakeup in the exercised race |
+| PD cancellation | 9 unit and 13 HTTP routing tests passed | Early failures drop the paired request, preserve status/Retry-After, and account for the right worker |
+| Decode rank admission | 195 tests and 168 subtests passed | Controller/scheduler accounting, HTTP failures before stream headers, cancellation/cleanup, transport errors, supported configurations, and compatibility |
+| L3 cost policy | 47 tests passed, including 3 multiprocess Gloo tests | Cost selection, rank agreement, sticky cancellation reason, partial completion, lifecycle, and argument validation |
+| Prefill time budget | 96 tests passed | Pure cost model, real PrefillAdder paths, alignment and continuation, load-back, hard limits, configuration, and a real CPU EAGLE bigram cache/checkpoint/tail cycle |
+| Combined argument compatibility | 44 tests and 70 subtests passed | Decode admission, L3 cost, Prefill time, hook registry, documented fields, legacy positional fields, and load-balance methods |
+| Standard-library launcher | 17 tests passed | Role commands, matching model/MTP settings, input validation, dry-run behavior, and mocked execution |
+| Documentation | 4 modified MDX pages compiled; Mintlify broken-links passed | MDX syntax and internal documentation links |
+
+Counts are reported by test group; they are not a unique-test grand total.
+Several argument and compatibility tests occur in more than one check.
+An independent reviewer also checked the time-budget selector against an
+exhaustive legal-chunk oracle for 100,000 seeded random cases; all matched.
+The repository's Python formatting/import checks and configured Ruff rules
+passed for the new scheduling code, as did `git diff --check`.
+
+## Environment and limits
+
+The checks used Python 3.12 with CPU PyTorch, the repository's runtime test
+dependencies, and Rust 1.90. The Gateway build used `vendored-openssl` and
+Protobuf compiler 33.0. Local Unix-socket HTTP tests and Gloo loopback tests ran
+with permission to create those local sockets. None of these checks exercised
+CUDA kernels, GPU memory allocation, real NIC transfers, or a Mooncake cluster.
+
+Four existing real HiCache allocator cases could not initialize in this
+environment: available host memory was below the runtime's existing 10 GiB
+host reserve. This failure occurred before the new cost policy initialized.
+The production reserve was not weakened, and these cases are not reported as
+passing. Other selected cache compatibility and ordering checks passed.
+
+The full `mint validate` command was attempted, but Mintlify's Internet
+initialization check blocked the build in this environment. The independent
+MDX compilation and `mint broken-links` checks succeeded. A full documentation
+site build remains for normal CI.
+
+GPU startup, model output correctness, GLM-5.3 MTP target/draft compatibility,
+per-rank KV capacity, transfer completion, and performance remain to be tested
+on the deployment hardware. Use [GPU_ACCEPTANCE.md](GPU_ACCEPTANCE.md) for the
+separate acceptance and calibration procedure. No throughput improvement,
+latency reduction, or maximum long-context concurrency is claimed here.
+
+For the generic Mamba load-back path, the existing GPU fixture
+`test_admission_keeps_mamba_h2d_destination_on_full_overdelivery` in
+`test/registered/unit/mem_cache/unified_radix_cache/test_unified_radix_cache_load_back.py`
+also needs a GPU run with time budgeting enabled to inspect copied state and
+slot ownership. The CPU admission tests cover control flow, not the actual H2D
+copy.
+
+## Reproducing the main checks
+
+Run from the repository root with its CPU test dependencies installed. Choose a
+writable cache directory; no checkpoint path is needed for these unit tests.
+
+```bash
+export PYTHONPATH=python
+export SGLANG_CACHE_DIR=/tmp/sglang-glm53-test-cache
+
+python3 test/registered/unit/test_glm53_pd_launch.py
+
+python3 -m pytest \
+  test/registered/unit/managers/test_dp_admission.py \
+  test/registered/unit/managers/test_dp_admission_integration.py \
+  test/registered/unit/managers/test_data_parallel_controller.py \
+  test/registered/unit/managers/test_load_inquirer.py \
+  test/registered/unit/managers/test_load_snapshot_backends.py \
+  test/registered/unit/server_args/test_dp_admission_args.py \
+  test/registered/unit/server_args/test_resolution_hook_registry.py \
+  test/registered/unit/server_args/test_server_args_docs_coverage.py \
+  test/registered/unit/server_args/test_server_args.py::TestServerArgsPositionalOrder \
+  test/registered/unit/server_args/test_server_args.py::TestLoadBalanceMethod \
+  test/registered/unit/entrypoints/test_dp_admission_http.py \
+  test/registered/unit/managers/test_tokenizer_manager_rid_cleanup.py \
+  -q
+
+GLOO_SOCKET_IFNAME=lo python3 -m unittest \
+  test.registered.unit.mem_cache.test_prefetch_cost \
+  test.registered.unit.mem_cache.test_storage_prefetch_lifecycle \
+  test.registered.unit.server_args.test_hicache_prefetch_cost_args
+
+python3 -m unittest \
+  test.registered.unit.managers.scheduler_components.test_prefill_time_budget \
+  test.registered.unit.server_args.test_prefill_time_budget_args \
+  test.registered.unit.managers.test_prefill_adder \
+  test.registered.unit.managers.test_deterministic_chunk_align \
+  test.registered.unit.managers.test_scheduler_held_row_admission
+```
+
+The Gateway checks use the following targets and filters. The ignored stress
+test is deliberately invoked separately; an ordinary test run does not execute
+its 200,000 rounds.
+
+```bash
+cargo test --manifest-path sgl-model-gateway/Cargo.toml \
+  --features vendored-openssl --lib core::token_bucket::
+cargo test --manifest-path sgl-model-gateway/Cargo.toml \
+  --features vendored-openssl --lib middleware::concurrency::
+cargo test --manifest-path sgl-model-gateway/Cargo.toml \
+  --features vendored-openssl --lib app_context::tests::
+cargo test --manifest-path sgl-model-gateway/Cargo.toml \
+  --features vendored-openssl --lib \
+  core::token_bucket::tests::refill_zero_does_not_lose_wakeups_under_stress \
+  -- --ignored --exact
+cargo test --manifest-path sgl-model-gateway/Cargo.toml \
+  --features vendored-openssl --lib routers::http::pd_router::tests::
+cargo test --manifest-path sgl-model-gateway/Cargo.toml \
+  --features vendored-openssl --test routing_tests pd_routing_test
+```
+
+These are targeted regression checks, not a claim that the repository's entire
+GPU and distributed CI matrix ran. The new Decode admission, L3 cost policy, and
+Prefill time model remain explicit opt-ins; the latter two require calibration
+for the actual model and complete TP/CP group.

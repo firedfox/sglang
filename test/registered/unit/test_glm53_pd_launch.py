@@ -196,6 +196,32 @@ class TestGLM53PDLaunch(unittest.TestCase):
         self.assert_invalid("decode", "--model-path", "/models/glm53", flag, model)
         self.assert_invalid("router", flag, model)
 
+    def test_prefill_time_budget_requires_a_calibrated_model_pair(self):
+        base = ["prefill", "--model-path", "/models/glm53"]
+        model = '{"fixed_ms":1.0,"linear_ms_per_token":0.01}'
+        baseline = self.plan(*base)
+        self.assertNotIn("--prefill-time-budget-ms", baseline["argv"])
+        self.assertNotIn("--prefill-time-model", baseline["argv"])
+        plan = self.plan(
+            *base, "--prefill-time-budget-ms", "50", "--prefill-time-model", model
+        )
+        self.assertEqual(self.value(plan, "--prefill-time-budget-ms"), "50.0")
+        self.assertEqual(self.value(plan, "--prefill-time-model"), model)
+        self.assertEqual(self.value(plan, "--chunked-prefill-size"), "131072")
+        self.assertEqual(self.value(plan, "--max-prefill-tokens"), "131072")
+        self.assert_invalid(*base, "--prefill-time-budget-ms", "50")
+        self.assert_invalid(*base, "--prefill-time-model", model)
+        for invalid in ("0", "-1", "nan", "inf", "invalid"):
+            self.assert_invalid(
+                *base,
+                "--prefill-time-budget-ms",
+                invalid,
+                "--prefill-time-model",
+                model,
+            )
+        for role in ("router", "decode"):
+            self.assert_invalid(role, "--prefill-time-budget-ms", "50")
+
     def test_worker_model_path_is_required(self):
         for role in ("prefill", "decode"):
             with self.subTest(role=role):

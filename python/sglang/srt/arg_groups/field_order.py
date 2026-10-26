@@ -554,5 +554,7 @@ POSITIONAL_FIELD_ORDER = (
     "dp_admission_queue_timeout",
     "dp_admission_snapshot_timeout",
     "hicache_storage_prefetch_cost_model",
+    "prefill_time_budget_ms",
+    "prefill_time_model",
 )
 # fmt: on

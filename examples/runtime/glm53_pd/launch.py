@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -29,6 +30,13 @@ def port_number(value):
     number = positive_int(value)
     if number > 65535:
         raise argparse.ArgumentTypeError("must be between 1 and 65535")
+    return number
+
+
+def positive_float(value):
+    number = float(value)
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
     return number
 
 
@@ -120,6 +128,16 @@ def build_parser():
                     "--hicache-storage-prefetch-cost-model",
                     type=json_object,
                     help="Opt in to cost_aware L3 prefetch with calibrated JSON rates",
+                )
+                role_parser.add_argument(
+                    "--prefill-time-budget-ms",
+                    type=positive_float,
+                    help="Estimated GPU prefill time per batch; requires --prefill-time-model",
+                )
+                role_parser.add_argument(
+                    "--prefill-time-model",
+                    type=json_object,
+                    help="Calibrated JSON coefficients; requires --prefill-time-budget-ms",
                 )
     return parser
 
@@ -326,6 +344,15 @@ def worker_command(args):
                     args.hicache_storage_prefetch_cost_model,
                 ]
             )
+        if args.prefill_time_budget_ms is not None:
+            argv.extend(
+                [
+                    "--prefill-time-budget-ms",
+                    str(args.prefill_time_budget_ms),
+                    "--prefill-time-model",
+                    args.prefill_time_model,
+                ]
+            )
     else:
         argv.extend(
             [
@@ -371,6 +398,12 @@ def main(argv=None):
     else:
         if args.model_path is None:
             parser.error("prefill/decode require --model-path or GLM53_MODEL_PATH")
+        if args.role == "prefill" and (
+            (args.prefill_time_budget_ms is None) != (args.prefill_time_model is None)
+        ):
+            parser.error(
+                "--prefill-time-budget-ms and --prefill-time-model are required together"
+            )
         command = worker_command(args)
         # An inherited value of 1 must not silently opt a worker into the experiment.
         env_overrides = {ALL_CP_ENV: "1" if args.all_cp_ranks_transfer else "0"}
