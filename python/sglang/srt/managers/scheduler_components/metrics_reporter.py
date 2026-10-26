@@ -130,6 +130,13 @@ class PrefillStats:
     log_storage_hit_tokens: int = 0
     num_pending_tokens: int = 0
     log_replay_tokens: int = 0
+    time_budget_ms: Optional[float] = None
+    time_estimated_ms: Optional[float] = None
+    time_limited_requests: int = 0
+    time_budget_overruns: int = 0
+    time_sum_extend: int = 0
+    time_sum_prefix_extend: int = 0
+    time_sum_extend_squared: int = 0
 
     @classmethod
     def from_adder(
@@ -139,6 +146,24 @@ class PrefillStats:
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
     ):
+        # Snapshot the committed shape before requests advance to another batch.
+        # These are model estimates and logical group tokens, not GPU timings.
+        time_stats = {}
+        if adder.prefill_time_budget is not None:
+            budget = adder.prefill_time_budget
+            time_stats = dict(
+                time_budget_ms=budget.budget_ms,
+                time_estimated_ms=budget.used_ms,
+                time_limited_requests=adder.prefill_time_limited_requests,
+                time_budget_overruns=adder.prefill_time_overrun_requests,
+                time_sum_extend=sum(r.extend_len for r in adder.can_run_list),
+                time_sum_prefix_extend=sum(
+                    r.prefix_len * r.extend_len for r in adder.can_run_list
+                ),
+                time_sum_extend_squared=sum(
+                    r.extend_len * r.extend_len for r in adder.can_run_list
+                ),
+            )
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_replay_tokens=adder.log_replay_tokens,
@@ -154,6 +179,7 @@ class PrefillStats:
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
+            **time_stats,
         )
 
 
@@ -762,6 +788,17 @@ class SchedulerMetricsReporter:
 
         if prefill_stats.log_replay_tokens:
             msg += f"#replay-token: {prefill_stats.log_replay_tokens}, "
+        if prefill_stats.time_budget_ms is not None:
+            msg += (
+                f"time-forward-id: {batch_iter}, "
+                f"time-budget-ms: {prefill_stats.time_budget_ms:.3f}, "
+                f"time-estimated-ms: {prefill_stats.time_estimated_ms:.3f}, "
+                f"time-limited-reqs: {prefill_stats.time_limited_requests}, "
+                f"time-budget-overruns: {prefill_stats.time_budget_overruns}, "
+                f"time-sum-x: {prefill_stats.time_sum_extend}, "
+                f"time-sum-hx: {prefill_stats.time_sum_prefix_extend}, "
+                f"time-sum-x2: {prefill_stats.time_sum_extend_squared}, "
+            )
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (

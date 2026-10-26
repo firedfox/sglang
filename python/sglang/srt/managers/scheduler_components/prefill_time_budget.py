@@ -133,6 +133,54 @@ class PrefillTimeBudget:
         or Mamba chunks). A finishing tail need not align. Minimum progress may
         exceed only the time estimate; it never exceeds ``token_limit``.
         """
+        hard_limit = min(remaining_tokens, token_limit)
+        fit = self.fit_tokens(prefix_len, hard_limit)
+        return self._select_aligned_tokens(
+            prefix_len=prefix_len,
+            remaining_tokens=remaining_tokens,
+            token_limit=token_limit,
+            fit=fit,
+            alignment=alignment,
+            extend_alignment=extend_alignment,
+            allow_minimum=allow_minimum and self.admitted_requests == 0,
+        )
+
+    def maximum_aligned_tokens(
+        self,
+        *,
+        prefix_len: int,
+        remaining_tokens: int,
+        token_limit: int,
+        alignment: int,
+        extend_alignment: int = 1,
+    ) -> int:
+        """Counterfactual shape under the same hard limits, without time cost.
+
+        This is used only for diagnostics: a time-limited request must be
+        smaller than this legal shape, not merely smaller than a raw token cap
+        that alignment or the input budget would have reduced anyway.
+        """
+        return self._select_aligned_tokens(
+            prefix_len=prefix_len,
+            remaining_tokens=remaining_tokens,
+            token_limit=token_limit,
+            fit=min(remaining_tokens, token_limit),
+            alignment=alignment,
+            extend_alignment=extend_alignment,
+            allow_minimum=False,
+        )
+
+    @staticmethod
+    def _select_aligned_tokens(
+        *,
+        prefix_len: int,
+        remaining_tokens: int,
+        token_limit: int,
+        fit: int,
+        alignment: int,
+        extend_alignment: int,
+        allow_minimum: bool,
+    ) -> int:
         if (
             prefix_len < 0
             or remaining_tokens < 0
@@ -142,7 +190,6 @@ class PrefillTimeBudget:
         ):
             raise ValueError("Invalid prefill token limit or alignment.")
         hard_limit = min(remaining_tokens, token_limit)
-        fit = self.fit_tokens(prefix_len, hard_limit)
         if fit >= remaining_tokens:
             return remaining_tokens
 
@@ -165,7 +212,7 @@ class PrefillTimeBudget:
                 return first + (fit - first) // period * period
             minimum = min(remaining_tokens, first)
 
-        if allow_minimum and self.admitted_requests == 0:
+        if allow_minimum:
             if minimum <= hard_limit:
                 return minimum
         return 0

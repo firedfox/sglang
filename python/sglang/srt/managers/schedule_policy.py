@@ -585,6 +585,7 @@ class _PrefillAdmission:
     max_new_tokens: int
     is_chunked: bool
     replay_len: int
+    time_limited: bool = False
 
 
 def mamba_prefill_chunk_grid() -> int:
@@ -646,6 +647,8 @@ class PrefillAdder:
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
         self.prefill_time_budget = prefill_time_budget
+        self.prefill_time_limited_requests = 0
+        self.prefill_time_overrun_requests = 0
         self.time_truncation_align_size = truncation_align_size
         self._time_budget_has_continuation = False
         if prefill_time_budget is not None and (
@@ -896,9 +899,9 @@ class PrefillAdder:
         remaining_tokens: int,
         token_limit: int,
         truncation_align_size: Optional[int] = None,
-    ) -> int:
+    ) -> tuple[int, bool]:
         if self.prefill_time_budget is None:
-            return token_limit
+            return token_limit, False
         # The minimum-progress exception applies only to time. In particular,
         # page-ceiled compute accounting must also fit max_prefill_tokens.
         input_limit = self.rem_input_tokens
@@ -912,14 +915,20 @@ class PrefillAdder:
             truncation_align_size or self.time_truncation_align_size or 1,
             self.mamba_chunk_grid,
         )
-        return self.prefill_time_budget.select_tokens(
+        selection_args = dict(
             prefix_len=prefix_len,
             remaining_tokens=remaining_tokens,
             token_limit=max(0, min(token_limit, input_limit)),
             alignment=alignment,
             extend_alignment=extend_alignment,
-            allow_minimum=not self.can_run_list,
         )
+        selected = self.prefill_time_budget.select_tokens(
+            **selection_args, allow_minimum=not self.can_run_list
+        )
+        hard_cap_shape = self.prefill_time_budget.maximum_aligned_tokens(
+            **selection_args
+        )
+        return selected, selected < hard_cap_shape
 
     def _prefill_time_load_back_prefix(self, req: Req) -> int:
         prefix_len = req.prefix_len + req.host_hit_length
@@ -943,11 +952,15 @@ class PrefillAdder:
                 prefix_len = max(prefix_len, path[-1].path_end)
         return prefix_len
 
-    def _commit_prefill_time_budget(self, req: Req) -> None:
+    def _commit_prefill_time_budget(
+        self, req: Req, *, time_limited: bool = False
+    ) -> None:
         if self.prefill_time_budget is None:
             return
         self.prefill_time_budget.charge(req.prefix_len, req.extend_len)
+        self.prefill_time_limited_requests += int(time_limited)
         if self.prefill_time_budget.used_ms > self.prefill_time_budget.budget_ms:
+            self.prefill_time_overrun_requests += 1
             logger.warning(
                 "Prefill time budget overrun: estimated=%.3f ms budget=%.3f ms "
                 "prefix=%d extend=%d; an empty batch permits one minimum "
@@ -1267,8 +1280,9 @@ class PrefillAdder:
         )
         if _rem_tokens is None:
             return req
+        time_limited = False
         if self.prefill_time_budget is not None:
-            _rem_tokens = self._time_budget_token_limit(
+            _rem_tokens, time_limited = self._time_budget_token_limit(
                 prefix_len=req.prefix_len,
                 remaining_tokens=cand_extend_input_len,
                 token_limit=_rem_tokens,
@@ -1314,7 +1328,7 @@ class PrefillAdder:
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
         )
-        self._commit_prefill_time_budget(req)
+        self._commit_prefill_time_budget(req, time_limited=time_limited)
         if self.prefill_time_budget is not None:
             self._time_budget_has_continuation = truncated
 
@@ -1347,8 +1361,9 @@ class PrefillAdder:
     ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         chunk_limit = self.rem_chunk_tokens
+        time_limited = False
         if self.prefill_time_budget is not None:
-            chunk_limit = self._time_budget_token_limit(
+            chunk_limit, time_limited = self._time_budget_token_limit(
                 prefix_len=req.prefix_len,
                 remaining_tokens=cand_extend_input_len,
                 token_limit=min(cand_extend_input_len, chunk_limit),
@@ -1507,7 +1522,7 @@ class PrefillAdder:
                 ),
             )
 
-        self._commit_prefill_time_budget(req)
+        self._commit_prefill_time_budget(req, time_limited=time_limited)
         return self.budget_state()
 
     def _defer_staged_for_capacity_if_idle(self, req: Req, *, pool: str) -> None:
@@ -1677,6 +1692,7 @@ class PrefillAdder:
                         max_new_tokens,
                         is_chunked,
                         self._replay_len(req, prefix_len),
+                        admission.time_limited and is_chunked,
                     )
                 elif req.host_loaded_length < promised_host_hit or (
                     self.prefill_time_budget is not None
@@ -1796,8 +1812,9 @@ class PrefillAdder:
             max_new_tokens = 0
             tile_tokens = extend_len
 
+        time_limited = False
         if self.prefill_time_budget is not None:
-            extend_len = self._time_budget_token_limit(
+            extend_len, time_limited = self._time_budget_token_limit(
                 prefix_len=prefix_len,
                 remaining_tokens=len(req.full_untruncated_fill_ids) - prefix_len,
                 token_limit=extend_len,
@@ -1821,7 +1838,7 @@ class PrefillAdder:
             return verdict
 
         return _PrefillAdmission(
-            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len
+            prefix_len, extend_len, max_new_tokens, is_chunked, replay_len, time_limited
         )
 
     def _commit_prefill_admission(
@@ -1844,7 +1861,7 @@ class PrefillAdder:
             ),
             replay_len=admission.replay_len,
         )
-        self._commit_prefill_time_budget(req)
+        self._commit_prefill_time_budget(req, time_limited=admission.time_limited)
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:

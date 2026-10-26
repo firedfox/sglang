@@ -264,6 +264,8 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.extend_len, 8)
         self.assertIs(adder.new_chunked_req, req)
         self.assertEqual(adder.prefill_time_budget.used_ms, 10)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+        self.assertEqual(adder.prefill_time_overrun_requests, 0)
         self.assertIs(adder.budget_state(), AddReqResult.OTHER)
 
     def test_time_budget_continuation_uses_true_prefix_not_cache_hit_log_prefix(self):
@@ -275,6 +277,73 @@ class TestPrefillAdder(CustomTestCase):
         self.assertAlmostEqual(adder.prefill_time_budget.used_ms, 16.64)
         self.assertEqual(adder.log_hit_tokens, 0)
         self.assertTrue(adder._time_budget_has_continuation)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+
+    def test_time_diagnostics_distinguish_time_cuts_from_hard_caps_and_alignment(self):
+        cases = (
+            # budget, input cap, chunk cap, committed extend, time-limited
+            (9, 64, 64, 8, 1),
+            (1000, 10, 64, 8, 0),
+            (9, 10, 64, 8, 0),
+            (9, 64, 10, 8, 0),
+        )
+        for mode in ("first", "continuation", "ignore_eos"):
+            for budget, input_cap, chunk_cap, extend, limited in cases:
+                with self.subTest(
+                    mode=mode, budget=budget, input_cap=input_cap, chunk_cap=chunk_cap
+                ):
+                    adder = self._timed_adder(
+                        budget, rem_input_tokens=input_cap, rem_chunk_tokens=chunk_cap
+                    )
+                    req = self._time_req(mode, extend=128)
+                    self.mock_tree_cache.disable = mode == "ignore_eos"
+                    req.sampling_params.ignore_eos = mode == "ignore_eos"
+                    if mode == "continuation":
+                        adder.add_chunked_req(req)
+                    else:
+                        adder.add_one_req(req, False, None)
+                    self.assertEqual(req.extend_len, extend)
+                    self.assertEqual(adder.prefill_time_limited_requests, limited)
+                    self.assertEqual(adder.prefill_time_overrun_requests, 0)
+
+    def test_time_diagnostics_snapshot_committed_global_shapes(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        adder = self._timed_adder(20, PrefillTimeModel(quadratic_ms_per_token2=0.01))
+        req = self._time_req("snapshot", extend=100, prefix=100)
+        adder.add_chunked_req(req)
+        stats = PrefillStats.from_adder(adder, [])
+        self.assertEqual(stats.time_budget_ms, 20)
+        self.assertAlmostEqual(stats.time_estimated_ms, 16.64)
+        self.assertEqual(stats.time_limited_requests, 1)
+        self.assertEqual(stats.time_budget_overruns, 0)
+        self.assertEqual(
+            (
+                stats.time_sum_extend,
+                stats.time_sum_prefix_extend,
+                stats.time_sum_extend_squared,
+            ),
+            (8, 800, 64),
+        )
+        # The async logger must not observe a later continuation's shape.
+        req.prefix_len = 0
+        req.extend_end = 4
+        adder.prefill_time_budget.used_ms = 999
+        self.assertEqual(stats.time_sum_prefix_extend, 800)
+        self.assertAlmostEqual(stats.time_estimated_ms, 16.64)
+
+    def test_time_diagnostics_are_absent_when_policy_is_disabled(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=64)
+        stats = PrefillStats.from_adder(adder, [])
+        self.assertIsNone(stats.time_budget_ms)
+        self.assertIsNone(stats.time_estimated_ms)
+        self.assertEqual(stats.time_limited_requests, 0)
 
     def test_time_budget_is_shared_by_complete_requests_in_batch(self):
         adder = self._timed_adder(
@@ -298,6 +367,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_one_req(req, False, None), AddReqResult.OTHER)
         self.assertEqual(adder.prefill_time_budget.used_ms, 0)
         self.assertEqual(adder.prefill_time_budget.admitted_requests, 0)
+        self.assertEqual(adder.prefill_time_limited_requests, 0)
         self.mock_tree_cache.init_load_back.assert_not_called()
         self.assertIsNone(req.extend_end)
 
@@ -317,6 +387,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual((req.prefix_len, req.extend_len), (0, 8))
         self.assertEqual(adder.prefill_time_budget.used_ms, 10)
         self.assertEqual(adder.prefill_time_budget.admitted_requests, 1)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
 
     def test_time_budget_successful_host_hit_charges_final_prefix(self):
         adder = self._timed_adder(
@@ -330,6 +401,7 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual((req.prefix_len, req.extend_len), (24, 8))
         self.assertAlmostEqual(adder.prefill_time_budget.used_ms, 6.48)
         self.assertEqual(adder.prefill_time_budget.admitted_requests, 1)
+        self.assertEqual(adder.prefill_time_limited_requests, 0)
 
     def test_time_budget_overdelivery_is_bounded_before_h2d_without_late_rejection(
         self,
@@ -553,6 +625,8 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIs(adder.add_one_req(second, False, None), AddReqResult.OTHER)
         self.assertEqual(adder.can_run_list, [first])
         self.assertEqual(adder.prefill_time_budget.used_ms, 4)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+        self.assertEqual(adder.prefill_time_overrun_requests, 1)
 
     def test_time_budget_never_expands_chunk_or_prefill_token_caps(self):
         for mode in ("first", "continuation", "ignore_eos"):
