@@ -1,0 +1,143 @@
+diff --git a/python/sglang/srt/managers/dp_admission.py b/python/sglang/srt/managers/dp_admission.py
+index 7982dc636..479c27a35 100644
+--- a/python/sglang/srt/managers/dp_admission.py
++++ b/python/sglang/srt/managers/dp_admission.py
+@@ -288,6 +288,9 @@ class SchedulerDPAdmission:
+         self.max_new_tokens_limit = max_new_tokens_limit or 0
+         self.sequence = 0
+         self.live: dict[int, _LiveReservation] = {}
++        # A loads read may retire an entry before the publisher runs. Keep a
++        # local generation so that such a read cannot consume the notification.
++        self.num_released_requests = 0
+ 
+     def acknowledge(self, tokenized_request: Any) -> None:
+         sequence = tokenized_request.dp_admission_sequence
+@@ -325,6 +328,7 @@ class SchedulerDPAdmission:
+             )
+             if terminal and not owns_resources:
+                 del self.live[key]
++                self.num_released_requests += 1
+                 continue
+             reserved_tokens += entry.tokens
+             if kv is not None:
+diff --git a/python/sglang/srt/managers/load_snapshot.py b/python/sglang/srt/managers/load_snapshot.py
+index 146c55af7..b6691bbb2 100644
+--- a/python/sglang/srt/managers/load_snapshot.py
++++ b/python/sglang/srt/managers/load_snapshot.py
+@@ -421,7 +421,8 @@ class ZmqLoadSnapshotWriter:
+         self._socket.setsockopt(_zmq.CONFLATE, 1)
+         self._socket.connect(endpoint)
+ 
+-    def write(self, snapshot: LoadSnapshot) -> None:
++    def write(self, snapshot: LoadSnapshot) -> bool:
++        """Return False when the nonblocking transport could not queue a frame."""
+         if snapshot.dp_rank != self.dp_rank:
+             raise ValueError(
+                 f"snapshot dp_rank={snapshot.dp_rank} does not match "
+@@ -430,7 +431,8 @@ class ZmqLoadSnapshotWriter:
+         try:
+             self._socket.send(snapshot_encoder.encode(snapshot), self._zmq.NOBLOCK)
+         except self._zmq.Again:
+-            pass
++            return False
++        return True
+ 
+     def close(self) -> None:
+         self._socket.close()
+diff --git a/python/sglang/srt/managers/scheduler.py b/python/sglang/srt/managers/scheduler.py
+index e83b96bd5..08522b23b 100644
+--- a/python/sglang/srt/managers/scheduler.py
++++ b/python/sglang/srt/managers/scheduler.py
+@@ -819,13 +819,38 @@ class Scheduler(
+         writer = self.load_snapshot_writer
+         if writer is None:
+             return
+-        if not force:
+-            writer.publish_counter += 1
+-            if writer.publish_counter < writer.publish_interval:
+-                return
+-        writer.publish_counter = 0
+         try:
+-            writer.write(self.load_inquirer.get_loads())
++            admission = getattr(self, "dp_admission", None)
++            if admission is not None and not force:
++                # Only inspect the local ledger and allocator on ordinary
++                # decode steps. A terminal output is not proof of KV release.
++                num_used, _ = (
++                    self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
++                )
++                current = admission.snapshot(num_used)
++                released, tokens = getattr(
++                    self, "_last_published_dp_admission", (0, None)
++                )
++                force = admission.num_released_requests != released or (
++                    tokens is not None
++                    and current["dp_admission_reserved_tokens"] < tokens
++                )
++            if not force:
++                writer.publish_counter += 1
++                if writer.publish_counter < writer.publish_interval:
++                    return
++            writer.publish_counter = 0
++            load = self.load_inquirer.get_loads()
++            written = writer.write(load)
++            if admission is not None and written is False:
++                return
++            if admission is not None:
++                # Clear only after successful publication; retries and new
++                # same-size admissions must not hide an ownership release.
++                self._last_published_dp_admission = (
++                    admission.num_released_requests,
++                    load.dp_admission_reserved_tokens,
++                )
+         except Exception as e:
+             logger.warning("load snapshot publish failed: %s", e)
+ 
+@@ -4281,7 +4306,9 @@ class Scheduler(
+         # Flush async trace ops here: in overlap mode this CPU work runs while
+         # the next batch's GPU forward is in flight, giving free overlap.
+         flush_trace_batch(batch.reqs)
+-        self.publish_load_snapshot(force=batch.forward_mode.is_extend())
++        admission_enabled = getattr(self, "dp_admission", None) is not None
++        if not admission_enabled:
++            self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+ 
+         if batch.forward_mode.is_decode():
+             self.batch_result_processor.process_batch_result_decode(batch, result)
+@@ -4297,6 +4324,11 @@ class Scheduler(
+         elif batch.forward_mode.is_idle():
+             self.batch_result_processor.process_batch_result_idle(batch, result)
+ 
++        if admission_enabled:
++            # Result processing has emitted terminal outputs and finished the
++            # allocator's free_group_end(). Publish actual available capacity.
++            self.publish_load_snapshot(force=batch.forward_mode.is_extend())
++
+         self._record_step_counters(batch, result)
+ 
+         self.metrics_reporter.log_batch_result_stats(batch, result)
+diff --git a/python/sglang/srt/managers/scheduler_components/load_inquirer.py b/python/sglang/srt/managers/scheduler_components/load_inquirer.py
+index df6bb81a9..7513fd516 100644
+--- a/python/sglang/srt/managers/scheduler_components/load_inquirer.py
++++ b/python/sglang/srt/managers/scheduler_components/load_inquirer.py
+@@ -92,7 +92,19 @@ class SchedulerLoadInquirer:
+     def get_loads(self) -> LoadSnapshot:
+         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
+         stats = self.get_stats()
+-        num_running_reqs = len(self.get_running_batch().reqs)
++        running_reqs = self.get_running_batch().reqs
++        num_running_reqs = len(running_reqs)
++        if self.get_dp_admission_snapshot is not None:
++            # A post-result snapshot precedes the next running-list filter.
++            # v0.5.18 clears req.kv on release; Mamba/backup ownership remains
++            # on Req itself. Deferred transfers must continue holding a slot.
++            num_running_reqs -= sum(
++                bool(req.finished_output)
++                and req.kv is None
++                and req.mamba_pool_idx is None
++                and req.retraction_backup is None
++                for req in running_reqs
++            )
+ 
+         waiting_queues = [self.get_waiting_queue()]
+         pending_token_queues = [self.get_waiting_queue()]

@@ -16,6 +16,11 @@ the release-feedback fix, decision diagnostics, and a controlled EAGLE compariso
 see [the next-round procedure](NEXT_ROUND.md). Its candidate profile is explicitly
 selected with `--eagle-profile 5/1/6`; the original launcher defaults remain a
 separate starting point and do not reproduce the deployed pd1 manifest.
+After receiving the operator's files, the [v0.5.18 backport package](backport_v0518/README.md)
+provides compatible incremental patches and a guarded deployment bundle. The
+actual uploaded benchmark is Chat/GSP, and the uploaded Prefill command omits
+EAGLE flags; use that package's evidence review before applying this generic
+launcher's choices to the older deployment.
 
 ## Review and launch
 
@@ -170,7 +175,11 @@ python3 examples/runtime/glm53_pd/launch.py decode \
 
 This prints a command; it does not read or update the deployment. Confirm the
 actual deployed queue deadline and pass `--dp-admission-queue-timeout` if it
-differs from the launcher's default. Use `--eagle-profile 5/1/6` on Prefill too.
+differs from the launcher's default. The generic launcher expects matching
+Prefill/Decode profiles, but the supplied pd1 Prefill command has no speculative
+flags. Preserve that deployed Prefill baseline and verify its resolved arguments,
+target/draft layout and transfer state before changing it; the compatible
+[v0.5.18 bundle](backport_v0518/README.md) does not add Prefill speculation.
 The queue is shared by the Decode controller, not a separate 64-entry queue on
 each attention DP rank.
 

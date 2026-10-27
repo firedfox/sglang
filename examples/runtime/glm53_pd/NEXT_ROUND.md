@@ -1,20 +1,35 @@
 # Continue the pd1 GLM-5.3 optimization
 
+## Update after receiving the deployment and benchmark files
+
+The supplied 29 patches now replay cleanly on official v0.5.18, and match the
+supplied ConfigMap. See the [validated v0.5.18 backport package](backport_v0518/README.md)
+for three compatible incremental patches, bundle generation, guarded rollout
+and rollback, and the file-based evidence review.
+
+The actual reported benchmark uses **`sglang-oai-chat` and
+`generated-shared-prefix`**, not native/random token-ID requests. Its reported
+input total is 13,099,124; the older client sums dataset estimates, so this does
+not establish actual server prompt usage. The uploaded files contain aggregate
+results, not per-request details or the original GSP generation arguments.
+The planner now requires an explicit workload and seed, plus explicit GSP
+parameters for Chat. The native example below is an independent baseline.
+
 This procedure follows the operator's 2026-10-27 report. The report describes
 one TP8/CP8 Prefill engine, one TP8/attention-DP8/EP8 Decode engine, Mooncake L3,
 and a PD router exposed by `sglang-pd1` / NodePort 31180. The separate
 `sglang-pd1-single2` deployment remains scaled to zero. These are reported facts,
 not a deployment discovered or changed by this development session.
 
-The runtime is reported as v0.5.18 with 29 backports, including
-`0041-dp-admission-kvfix.patch`. This branch has a different source base. The
-deployed YAML, backport and raw benchmark JSON are needed before applying these
-changes to that runtime. Nothing in this directory patches a live ConfigMap or
-starts a benchmark automatically.
+The supplied runtime manifest uses v0.5.18 with 29 backports, including
+`0041-dp-admission-kvfix.patch`. This branch has a different source base, so use
+the compatible package linked above rather than applying current runtime commits
+directly. Its default candidate changes only P/D patch-volume references. No
+tool in this directory deploys resources or starts a benchmark automatically.
 
 ## What the current measurements establish
 
-The operator reported the following for 96 requests, 131,072 input tokens and
+The operator reported the following for 96 requests labeled 128K input and
 1,024 output tokens each, at client concurrency 32:
 
 | Reported stage | Duration | TTFT p50 | TPOT p50 | Output tokens/s |
@@ -32,10 +47,11 @@ and raw results are not available here. B versus A also changes the stated cache
 condition. The TPOT values are medians; multiplying a median by throughput does
 not measure mean active decode concurrency or GPU utilization.
 
-For this fixed-length test, 96 successful full outputs should total **98,304
-output tokens**, with **12,582,912 input tokens**. Verify these counts in raw
-results before comparing throughput. Discovered client defects below do not
-prove that the earlier report used that client or contained incorrect results.
+For 96 successful full 1024-token outputs, the total should be **98,304 output
+tokens**, which agrees with the uploaded summary. **12,582,912 input tokens**
+is the expected total only for the separate native token-ID experiment, not the
+uploaded Chat/GSP run. The new client records actual Chat usage and its coverage.
+The aggregate summary alone cannot establish each request's completion status.
 
 ## Changes prepared in this branch, in priority order
 
@@ -69,6 +85,7 @@ The result has `measurement_schema_version: 2`:
 | `max_concurrent_requests` | Exact peak from request start/end intervals, not whole-second buckets |
 | `request_details[]` | With `--output-details`: success, status, reason, error, interval, actual tokens, cache details and speculative counters |
 | `request_speculative_metrics` | This run's successful responses, with counter coverage and weighted ratios |
+| `input_token_accounting` | Server prompt-usage coverage and explicit dataset fallback for Chat |
 | `accept_length`, `accept_length_source` | Legacy first-worker/first-rank lifetime observation; not a whole-run MTP measurement |
 
 For successful responses that all supply final counters, the new MTP acceptance
@@ -77,10 +94,14 @@ is `sum(spec_num_correct_drafts) / sum(spec_num_proposed_drafts)`. Missing
 coverage produces `null`, not a fabricated ratio or an average of request
 averages. A deployed older runtime may not supply every counter.
 
-Existing arrays remain available. JSON consumers must allow `null` latency
-statistics and the string `"inf"` for unlimited request rate. ITL still uses
-chunk interpolation, and peak tokens/s remains a client-side estimate. Neither
-is a measurement of individual GPU token completion times.
+The same strict final-count and completion checks now cover `sglang-oai-chat`,
+using its actual final usage block and normal Chat terminal events. Missing final
+usage produces an auditable failure. The client preserves an explicit false
+usage option, but v0.5.18 can still return usage when its server default is on,
+as in the supplied Decode arguments. Existing arrays remain available.
+JSON consumers must allow `null` statistics and the string `"inf"`
+for unlimited request rate. Chat's token peak is also `null` without per-token
+timestamps; its chunk intervals do not measure individual token arrivals.
 
 ### 2. Release Decode admission capacity promptly
 
@@ -128,7 +149,7 @@ the budget preventing another complete request from joining the batch.
 the existing inter-log input-throughput statistic replace the profiled GPU
 calibration procedure in [GPU_ACCEPTANCE.md](GPU_ACCEPTANCE.md).
 
-L3 lifecycle counts are now exported as:
+In the current development runtime, L3 lifecycle counts are exported as:
 
 ```text
 sglang:storage_prefetch_outcomes_total{outcome="stopped_cost_aware", ...}
@@ -141,6 +162,12 @@ events. Outcomes overlap; do not sum them into a request count. Rank-agreed
 events can be replicated across ranks, so choose a representative rank rather
 than multiplying the request count by CP/TP size. The existing unfulfilled-token
 counter continues to measure token attempts, not saved compute or final misses.
+
+The compatible v0.5.18 `0044` backport retains the older
+`sglang:cache_operations_total{operation="prefetch",reason=...}` metric and
+`all_ranks_ready_or_any_terminated` agreement rule. It does not add the newer
+14-outcome collector. Its per-rank terminal reason is not a global count of
+cost-canceled requests; see the backport package for the exact interpretation.
 
 For a small diagnostic sample, enable the existing worker DEBUG log level. Each
 cost-aware IO attempt emits at its existing terminal boundary:
@@ -163,7 +190,8 @@ remaining_tokens / effective_read_rate
 
 For example, if effective read rate is exactly 34k tokens/s, recompute is 47k,
 the margin is 1.2, fixed cost is zero, the observation is valid, and partial KV
-is reusable (`recompute_tokens == remaining_tokens`), the policy cancels.
+is reusable (`recompute_tokens == remaining_tokens`), the local policy votes to
+cancel. The older multi-rank agreement can still prevent global termination.
 Already reading most of that same reusable span does not reverse this ratio.
 A larger margin, positive fixed cost, a different observed read rate, an
 insufficient sampling window, or an independent all-or-nothing sidecar can
@@ -174,7 +202,7 @@ alone.
 
 ## Controlled next experiment
 
-First repeat the candidate `5/1/6` and earlier `3/1/4` profiles while keeping the
+First repeat the candidate Decode `5/1/6` and earlier `3/1/4` profiles while keeping the
 1500 ms budget, both calibrated models, queue 64, router, weights and hardware
 fixed. The offline planner creates three rounds by default, alternates profile
 order, and pairs each fresh namespace with an immediate replay: **12 jobs**.
@@ -183,6 +211,7 @@ It only prints a manifest; it neither reconfigures workers nor runs requests.
 ```bash
 mkdir -p results/glm53-next
 python3 examples/runtime/glm53_pd/plan_next_round.py \
+  --workload native-random --seed 20261026 \
   --base-url http://YOUR_NODE_IP:31180 \
   --tokenizer /models/GLM-5.3/snapshots/30333038ada1f1dacb294a93270305a890b50c14 \
   --dataset /datasets/ShareGPT_V3_unfiltered_cleaned_split.json \
@@ -190,8 +219,11 @@ python3 examples/runtime/glm53_pd/plan_next_round.py \
   > results/glm53-next/plan.json
 ```
 
-The manifest includes literal argument arrays and shell-quoted commands,
-required P/D profile, unique output paths, seed, expected token totals and a
+This native/random command is a separate controlled experiment. For the
+reported Chat/GSP family, use `--workload chat-gsp` with the explicitly chosen
+generation parameters documented in the backport package. The manifest includes
+literal argument arrays and shell-quoted commands, required Decode profile,
+unique output paths, seed, expected token totals where known and a
 dataset SHA-256 when the file is present. `client_checkout_revision` identifies
 this checkout, not whatever installed module another interpreter may import.
 Run with this branch's client environment and record its resolved package path
@@ -202,8 +234,11 @@ the hash of the file actually loaded. The random dataset loader can download a
 default dataset when the supplied path is missing or invalid; a missing digest
 in this offline plan is not evidence that the execution host used the same data.
 
-Before each profile change, drain the dedicated test workload, configure both
-P and D consistently, verify readiness, and warm up graph capture separately.
+Before each profile change, drain the dedicated test workload, verify the
+actual P/D target/draft layout and resolved settings, configure the Decode
+profile, verify readiness, and warm up graph capture separately. The uploaded
+P command has no speculative flags; the planner preserves a validated Prefill
+configuration and does not automatically add them.
 Keep other traffic out of the measurement window. Run manifest jobs in order.
 Do not reuse an existing result file: the benchmark appends JSONL. Use each
 namespace only for its intended fresh/replay pair. A fresh namespace can still
@@ -232,17 +267,16 @@ Further draft depth, chunk size, CP layout, communication SM allocation and
 kernel changes remain separate experiments. The current observations do not
 justify selecting a larger draft, reducing CP, or changing the SM split yet.
 
-## Deployment inputs needed to finish the backport
+## Backport and deployment status
 
-Provide the repository/location or files for
-`sglang/pd1/sglang-pd1-glm53.rbg.yaml`, the complete applied
-`0041-dp-admission-kvfix.patch` and patch ordering, plus raw results behind
-`bench-pd1-20261027-glm53/report.html`. The live resolved P/D/router arguments,
-cost/time JSON and per-rank startup capacities are also useful. The report HTML
-alone cannot establish final token counts, failures or MTP counter coverage.
+The patch archive, ConfigMap, desired RBG YAML, calibrated parameter JSON and
+run5 aggregate results have now been inspected. The compatible backport package
+records the completed replay and CPU validation. The bundle builder prepares
+the next immutable ConfigMap and narrow RBG changes from those local inputs.
 
-Review these changes against the actual v0.5.18 backport before producing its
-next ConfigMap. Preserve the separately scaled-down deployment. Until that
-integration and hardware acceptance run, this branch contains tested CPU/HTTP/
-IPC changes and an executable measurement procedure, not new online performance
-results.
+The original benchmark generation arguments, per-request output details,
+running resolved arguments and per-rank startup capacities are not in the
+aggregate files. Cluster access and hardware acceptance remain separate work.
+The uploaded Service is ClusterIP without a NodePort; the bundle does not mutate
+it or the separately scaled-down deployment. No new online performance result
+is claimed by these source and packaging changes.

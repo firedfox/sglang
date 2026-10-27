@@ -1,0 +1,275 @@
+diff --git a/python/sglang/srt/managers/schedule_policy.py b/python/sglang/srt/managers/schedule_policy.py
+index 4c7efc34b..e541ba682 100644
+--- a/python/sglang/srt/managers/schedule_policy.py
++++ b/python/sglang/srt/managers/schedule_policy.py
+@@ -567,6 +567,8 @@ class PrefillAdder:
+         self.dllm_config = dllm_config
+         self.mamba_chunk_grid = mamba_prefill_chunk_grid()
+         self.prefill_time_budget = prefill_time_budget
++        self.prefill_time_limited_requests = 0
++        self.prefill_time_overrun_requests = 0
+         self.time_truncation_align_size = truncation_align_size
+         self._time_budget_has_continuation = False
+         if prefill_time_budget is not None and (
+@@ -886,16 +888,16 @@ class PrefillAdder:
+         remaining_tokens: int,
+         token_limit: int,
+         truncation_align_size: Optional[int] = None,
+-    ) -> int:
++    ) -> tuple[int, bool]:
+         if self.prefill_time_budget is None:
+-            return token_limit
++            return token_limit, False
+         # The minimum-progress exception applies only to time. In particular,
+         # page-ceiled compute accounting must also fit max_prefill_tokens.
+         input_limit = self.rem_input_tokens // self.page_size * self.page_size
+         # ``alignment`` constrains the absolute chunk end (KV pages);
+         # ``extend_alignment`` constrains the query length (attention split
+         # tiles or Mamba kernel chunks).
+-        return self.prefill_time_budget.select_tokens(
++        selection_args = dict(
+             prefix_len=prefix_len,
+             remaining_tokens=remaining_tokens,
+             token_limit=max(0, min(token_limit, input_limit)),
+@@ -904,16 +906,26 @@ class PrefillAdder:
+                 truncation_align_size or self.time_truncation_align_size or 1,
+                 self.mamba_chunk_grid,
+             ),
+-            allow_minimum=not self.can_run_list,
+         )
++        selected = self.prefill_time_budget.select_tokens(
++            **selection_args, allow_minimum=not self.can_run_list
++        )
++        hard_cap_shape = self.prefill_time_budget.maximum_aligned_tokens(
++            **selection_args
++        )
++        return selected, selected < hard_cap_shape
+ 
+-    def _commit_prefill_time_budget(self, req: Req) -> None:
++    def _commit_prefill_time_budget(
++        self, req: Req, *, time_limited: bool = False
++    ) -> None:
+         if self.prefill_time_budget is None:
+             return
+         self.prefill_time_budget.charge(
+             req.extend_range.start, req.extend_range.length
+         )
++        self.prefill_time_limited_requests += int(time_limited)
+         if self.prefill_time_budget.used_ms > self.prefill_time_budget.budget_ms:
++            self.prefill_time_overrun_requests += 1
+             logger.warning(
+                 "Prefill time budget overrun: estimated=%.3f ms budget=%.3f ms "
+                 "prefix=%d extend=%d; an empty batch permits one minimum "
+@@ -1121,8 +1133,9 @@ class PrefillAdder:
+         cand_extend_input_len = len(req.full_untruncated_fill_ids) - len(
+             req.prefix_indices
+         )
++        time_limited = False
+         if self.prefill_time_budget is not None:
+-            _rem_tokens = self._time_budget_token_limit(
++            _rem_tokens, time_limited = self._time_budget_token_limit(
+                 prefix_len=len(req.prefix_indices),
+                 remaining_tokens=cand_extend_input_len,
+                 token_limit=_rem_tokens,
+@@ -1144,7 +1157,7 @@ class PrefillAdder:
+             req.retracted_stain,
+             mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+         )
+-        self._commit_prefill_time_budget(req)
++        self._commit_prefill_time_budget(req, time_limited=time_limited)
+         if self.prefill_time_budget is not None:
+             self._time_budget_has_continuation = truncated
+ 
+@@ -1179,8 +1192,9 @@ class PrefillAdder:
+             req.prefix_indices
+         )
+         chunk_limit = self.rem_chunk_tokens
++        time_limited = False
+         if self.prefill_time_budget is not None:
+-            chunk_limit = self._time_budget_token_limit(
++            chunk_limit, time_limited = self._time_budget_token_limit(
+                 prefix_len=len(req.prefix_indices),
+                 remaining_tokens=cand_extend_input_len,
+                 token_limit=min(cand_extend_input_len, chunk_limit),
+@@ -1326,13 +1340,14 @@ class PrefillAdder:
+                 mamba_gap_reserve=self._mamba_gap_budget_for_req(req),
+             )
+ 
+-        self._commit_prefill_time_budget(req)
++        self._commit_prefill_time_budget(req, time_limited=time_limited)
+ 
+         return self.budget_state()
+ 
+     def add_one_req(
+         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
+     ):
++        time_limited = False
+         # TODO support cp with multiple requests
+         # Enabling context parallelism currently presents precision issues;
+         # therefore, the prefill-batch setting is temporarily set to 1.
+@@ -1520,7 +1535,7 @@ class PrefillAdder:
+ 
+                 if self.prefill_time_budget is not None:
+                     remaining_tokens = len(req.full_untruncated_fill_ids) - prefix_len
+-                    trunc_len = self._time_budget_token_limit(
++                    trunc_len, time_limited = self._time_budget_token_limit(
+                         prefix_len=prefix_len,
+                         remaining_tokens=remaining_tokens,
+                         token_limit=trunc_len,
+@@ -1576,7 +1591,7 @@ class PrefillAdder:
+                     storage_hit_len=req.storage_hit_length,
+                 )
+ 
+-        self._commit_prefill_time_budget(req)
++        self._commit_prefill_time_budget(req, time_limited=time_limited)
+         return self.budget_state()
+ 
+     def preempt_to_schedule(self, req: Req, server_args: ServerArgs) -> bool:
+diff --git a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+index 21eb39197..222ee8fef 100644
+--- a/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
++++ b/python/sglang/srt/managers/scheduler_components/metrics_reporter.py
+@@ -63,6 +63,13 @@ class PrefillStats:
+     log_host_hit_tokens: int = 0
+     log_storage_hit_tokens: int = 0
+     num_pending_tokens: int = 0
++    time_budget_ms: Optional[float] = None
++    time_estimated_ms: Optional[float] = None
++    time_limited_requests: int = 0
++    time_budget_overruns: int = 0
++    time_sum_extend: int = 0
++    time_sum_prefix_extend: int = 0
++    time_sum_extend_squared: int = 0
+ 
+     @classmethod
+     def from_adder(
+@@ -72,6 +79,26 @@ class PrefillStats:
+         enable_priority_scheduling: bool = False,
+         num_pending_tokens: int = 0,
+     ):
++        # v0.5.18 stores the committed logical shape in extend_range. Snapshot
++        # before a continuation mutates it; these are estimates, not GPU times.
++        time_stats = {}
++        if adder.prefill_time_budget is not None:
++            budget = adder.prefill_time_budget
++            time_stats = dict(
++                time_budget_ms=budget.budget_ms,
++                time_estimated_ms=budget.used_ms,
++                time_limited_requests=adder.prefill_time_limited_requests,
++                time_budget_overruns=adder.prefill_time_overrun_requests,
++                time_sum_extend=sum(r.extend_range.length for r in adder.can_run_list),
++                time_sum_prefix_extend=sum(
++                    r.extend_range.start * r.extend_range.length
++                    for r in adder.can_run_list
++                ),
++                time_sum_extend_squared=sum(
++                    r.extend_range.length * r.extend_range.length
++                    for r in adder.can_run_list
++                ),
++            )
+         return cls(
+             log_input_tokens=adder.log_input_tokens,
+             log_hit_tokens=adder.log_hit_tokens,
+@@ -86,6 +113,7 @@ class PrefillStats:
+             ),
+             num_new_seqs=len(adder.can_run_list),
+             num_pending_tokens=num_pending_tokens,
++            **time_stats,
+         )
+ 
+ 
+@@ -594,6 +622,18 @@ class SchedulerMetricsReporter:
+             f"#pending-token: {prefill_stats.num_pending_tokens}, "
+         )
+ 
++        if prefill_stats.time_budget_ms is not None:
++            msg += (
++                f"time-forward-id: {batch_iter}, "
++                f"time-budget-ms: {prefill_stats.time_budget_ms:.3f}, "
++                f"time-estimated-ms: {prefill_stats.time_estimated_ms:.3f}, "
++                f"time-limited-reqs: {prefill_stats.time_limited_requests}, "
++                f"time-budget-overruns: {prefill_stats.time_budget_overruns}, "
++                f"time-sum-x: {prefill_stats.time_sum_extend}, "
++                f"time-sum-hx: {prefill_stats.time_sum_prefix_extend}, "
++                f"time-sum-x2: {prefill_stats.time_sum_extend_squared}, "
++            )
++
+         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
+             msg += (
+diff --git a/python/sglang/srt/managers/scheduler_components/prefill_time_budget.py b/python/sglang/srt/managers/scheduler_components/prefill_time_budget.py
+index 5b5a3dc01..8075a09ae 100644
+--- a/python/sglang/srt/managers/scheduler_components/prefill_time_budget.py
++++ b/python/sglang/srt/managers/scheduler_components/prefill_time_budget.py
+@@ -133,6 +133,54 @@ class PrefillTimeBudget:
+         or Mamba chunks). A finishing tail need not align. Minimum progress may
+         exceed only the time estimate; it never exceeds ``token_limit``.
+         """
++        hard_limit = min(remaining_tokens, token_limit)
++        fit = self.fit_tokens(prefix_len, hard_limit)
++        return self._select_aligned_tokens(
++            prefix_len=prefix_len,
++            remaining_tokens=remaining_tokens,
++            token_limit=token_limit,
++            fit=fit,
++            alignment=alignment,
++            extend_alignment=extend_alignment,
++            allow_minimum=allow_minimum and self.admitted_requests == 0,
++        )
++
++    def maximum_aligned_tokens(
++        self,
++        *,
++        prefix_len: int,
++        remaining_tokens: int,
++        token_limit: int,
++        alignment: int,
++        extend_alignment: int = 1,
++    ) -> int:
++        """Counterfactual shape under the same hard limits, without time cost.
++
++        This is used only for diagnostics: a time-limited request must be
++        smaller than this legal shape, not merely smaller than a raw token cap
++        that alignment or the input budget would have reduced anyway.
++        """
++        return self._select_aligned_tokens(
++            prefix_len=prefix_len,
++            remaining_tokens=remaining_tokens,
++            token_limit=token_limit,
++            fit=min(remaining_tokens, token_limit),
++            alignment=alignment,
++            extend_alignment=extend_alignment,
++            allow_minimum=False,
++        )
++
++    @staticmethod
++    def _select_aligned_tokens(
++        *,
++        prefix_len: int,
++        remaining_tokens: int,
++        token_limit: int,
++        fit: int,
++        alignment: int,
++        extend_alignment: int,
++        allow_minimum: bool,
++    ) -> int:
+         if (
+             prefix_len < 0
+             or remaining_tokens < 0
+@@ -142,7 +190,6 @@ class PrefillTimeBudget:
+         ):
+             raise ValueError("Invalid prefill token limit or alignment.")
+         hard_limit = min(remaining_tokens, token_limit)
+-        fit = self.fit_tokens(prefix_len, hard_limit)
+         if fit >= remaining_tokens:
+             return remaining_tokens
+ 
+@@ -165,7 +212,7 @@ class PrefillTimeBudget:
+                 return first + (fit - first) // period * period
+             minimum = min(remaining_tokens, first)
+ 
+-        if allow_minimum and self.admitted_requests == 0:
++        if allow_minimum:
+             if minimum <= hard_limit:
+                 return minimum
+         return 0

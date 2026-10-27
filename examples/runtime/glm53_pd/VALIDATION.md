@@ -30,9 +30,10 @@ passed for the new scheduling code, as did `git diff --check`.
 ## Follow-up after the operator's pd1 report
 
 The operator separately reported a deployed v0.5.18 backport and four GPU runs.
-Those raw files and the deployed patch are not present in this checkout. The
-following checks validate this branch's new code; they neither reproduce those
-GPU measurements nor establish a performance gain on pd1.
+At this stage, the supporting files and deployed patches had not yet been
+supplied. The following checks validate this branch's new code; they neither
+reproduce those GPU measurements nor establish a performance gain on pd1.
+The later file-based reconstruction is recorded separately below.
 
 | Area | Result | What the checks establish |
 | --- | --- | --- |
@@ -93,6 +94,48 @@ python3 -m unittest \
 ```
 
 ## Environment and limits
+
+### File-based v0.5.18 backport follow-up
+
+The subsequently supplied patch archive, ConfigMap, RBG manifest, calibrated
+parameters and aggregate benchmark results have now been inspected. All 29
+patches matched the ConfigMap and applied cleanly to official v0.5.18 commit
+`71de97b264b04dcd514cf904003028aefe9775c8`. The separate
+[backport package](backport_v0518/README.md) records the version-specific
+adaptations, source hashes and deployment procedure.
+
+| Area | Result | Scope |
+| --- | --- | --- |
+| Chat benchmark audit | 48 tests and 52 subtests passed | Actual final usage, terminal events, reasoning/tools, truncated continuous-usage streams, prompt-count sources, unknown token peak and other backend compatibility |
+| v0.5.18 DP release backport | 47 tests and 4 subtests passed | Older Req ownership, actual local IPC, EAGLE result handling, old transfer queue cleanup and snapshot backends |
+| v0.5.18 Prefill/L3 diagnostics | 43 tests passed | Older extend-range layout, existing cache-observation lifecycle, CPU tensors and simulated collective outcomes |
+| Explicit workload planner | 28 tests passed | 9 planner cases plus the 19 unchanged launcher cases; Chat/GSP explicit parameters and separate native baseline |
+| Bundle builder | 19 tests passed | Real archive/YAML checks, guarded JSON Patch and rollback, independent Router candidates, shell argument quoting and worker startup rejection on installer failure |
+| Source-state installer | 25 tests and 13 subtests passed | Real GNU patch, exact source-state/hash checks, repeated application, symlink rejection, concurrent modification and installation rollback |
+
+The packaged older-runtime tests plus its existing PrefillAdder and load-snapshot
+groups also ran together: **90 tests and 29 subtests passed**. The builder,
+installer, planner and unchanged launcher ran together: **72 tests and 116
+subtests passed**. These are combined reruns of the groups above, not additional
+unique-test totals.
+
+Using the complete supplied inputs, the generated installer applied all **32
+patches** from the official affected source files, and only the **3 extensions**
+from the supplied 29-patch state. Both produced the same candidate hashes;
+repeated application was a no-op. An unknown source state was rejected without
+changing its files. All **43 affected Python files** compiled. The generated
+runtime and optional Router JSON patches were also checked against the actual
+supplied RBG, including exact rollback and independent change scope. The bundle
+records these checks in its validation JSON files.
+
+The old runtime environment pins Transformers 5.12.1 and Tokenizers 0.22.2;
+it uses CPU PyTorch 2.14.1 rather than the target source's declared 2.13.0.
+No GPU or actual image compatibility is inferred. The older transfer queue
+does not have the newer physical-drain acknowledgement helpers; the backport
+retains its existing cleanup protocol. The source replay and prepared bundle
+do not establish that any Kubernetes rollout or new hardware benchmark ran.
+
+### Initial development environment
 
 The checks used Python 3.12 with CPU PyTorch, the repository's runtime test
 dependencies, and Rust 1.90. The Gateway build used `vendored-openssl` and
