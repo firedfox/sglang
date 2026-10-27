@@ -480,6 +480,8 @@ class TestMooncakeEarlySend(unittest.TestCase):
         manager = SimpleNamespace(
             enable_trace=False,
             enable_staging=False,
+            _mark_thread_progress=MagicMock(),
+            _reset_session_transfer_failures=MagicMock(),
             enable_deferred_decode_kv_release=True,
             _staging_outstanding=defaultdict(int),
             request_status={1: KVPoll.WaitingForInput},

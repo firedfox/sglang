@@ -101,6 +101,22 @@ class Parallel(msgspec.Struct):
             ],
         ),
     ] = "auto"
+    enable_dp_admission: A[
+        bool,
+        "Reserve a request slot and its full generation KV budget on a decode DP rank before dispatch. Requires single-node attention DP, total_tokens balancing, and a disabled decode radix cache. Disabled by default.",
+    ] = False
+    dp_admission_max_queued_requests: A[
+        int,
+        "Maximum requests waiting in the decode DP controller admission queue, per process. Zero rejects occupied budgets immediately with HTTP 429.",
+    ] = 0
+    dp_admission_queue_timeout: A[
+        float,
+        "Maximum seconds to wait in the bounded decode DP admission queue.",
+    ] = 1.0
+    dp_admission_snapshot_timeout: A[
+        float,
+        "Maximum age in seconds of a scheduler acknowledgement snapshot used for decode DP admission. Missing or stale capacity returns HTTP 503.",
+    ] = 30.0
     attn_cp_size: A[
         int,
         Arg(

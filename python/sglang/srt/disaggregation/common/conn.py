@@ -8,7 +8,7 @@ import threading
 import time
 from collections import defaultdict
 from contextlib import nullcontext
-from typing import Dict, List, NamedTuple, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, NamedTuple, Optional, Set, Tuple, Union
 
 import msgspec
 import numpy as np
@@ -1820,6 +1820,7 @@ class CommonKVManager(BaseKVManager):
                 # wake this thread immediately by setting the event.
                 if self._heartbeat_shutdown.wait(self.heartbeat_interval):
                     break
+                self._mark_heartbeat_checker_progress()
                 with self.connection_lock:
                     addresses = list(self.prefill_info_table.keys())
 
@@ -1858,11 +1859,13 @@ class CommonKVManager(BaseKVManager):
                             if bootstrap_addr in self.session_pool:
                                 del self.session_pool[bootstrap_addr]
 
-        t = threading.Thread(
-            target=heartbeat_checker,
-            name="HeartbeatChecker",
-            daemon=True,
-        )
+        return self._start_heartbeat_checker(heartbeat_checker)
+
+    def _mark_heartbeat_checker_progress(self):
+        """Backend-specific progress metric hook."""
+
+    def _start_heartbeat_checker(self, target: Callable[[], None]) -> threading.Thread:
+        t = threading.Thread(target=target, name="HeartbeatChecker", daemon=True)
         t.start()
         return t
 

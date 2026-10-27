@@ -6,9 +6,17 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import compute_spec_context_reserve
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    get_parallel,
+    get_spec,
+    publish,
+    restore_context,
+    snapshot_context,
+)
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -43,6 +51,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         cls._scheduler_logger.setLevel(cls._old_level)
 
     def setUp(self):
+        previous = snapshot_context()
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(restore_context, previous)
         # Tests use an unsharded topology unless they explicitly override it.
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
@@ -112,6 +123,45 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         self.assertFalse(satisfies_rules(max_new_tokens + 1))
         self.assertLessEqual(req.sampling_params.min_new_tokens, max_new_tokens)
         return max_new_tokens
+
+    def test_speculative_tail_and_overlap_fit_inside_context(self):
+        for draft, steps in ((4, 3), (6, 5), (9, 8)):
+            for overlap in (False, True):
+                for requested in (None, 4096, 8):
+                    with self.subTest(draft=draft, overlap=overlap, output=requested):
+                        with get_spec().override(
+                            speculative_algorithm="EAGLE",
+                            speculative_eagle_topk=1,
+                            speculative_num_steps=steps,
+                            speculative_num_draft_tokens=draft,
+                        ):
+                            reserve = compute_spec_context_reserve(overlap)
+                        scheduler = self._new_scheduler(
+                            max_req_len=4096, max_total_num_tokens=16384, page_size=64
+                        )
+                        scheduler.spec_context_reserve = reserve
+                        req = self._new_req(
+                            requested, input_len=4000, min_new_tokens=128
+                        )
+                        scheduler.init_req_max_new_tokens(req)
+                        self.assertEqual(reserve, draft * (2 if overlap else 1))
+                        self.assertLess(
+                            len(req.origin_input_ids)
+                            + req.sampling_params.max_new_tokens
+                            + reserve,
+                            scheduler.max_req_len,
+                        )
+                        if requested == 8:
+                            self.assertEqual(req.sampling_params.max_new_tokens, 8)
+                        self.assertLessEqual(
+                            req.sampling_params.min_new_tokens,
+                            req.sampling_params.max_new_tokens,
+                        )
+
+    def test_ordinary_decode_has_no_speculative_context_charge(self):
+        with get_spec().override(speculative_algorithm=None):
+            self.assertEqual(compute_spec_context_reserve(False), 0)
+            self.assertEqual(compute_spec_context_reserve(True), 0)
 
     def test_limit_disabled_by_default(self):
         with envs.SGLANG_MAX_NEW_TOKENS_LIMIT.override(None):

@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 # Kept in sync with the server-args choices; validated here so an admin request
 # carrying a bad policy is rejected before it can touch the controller.
-_PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout")
+_PREFETCH_POLICIES = ("best_effort", "wait_complete", "timeout", "cost_aware")
 _WRITE_POLICIES = ("write_back", "write_through", "write_through_selective")
 
 
@@ -66,6 +66,14 @@ class StorageAttachment:
         )
         if invalid is not None:
             return False, invalid
+
+        if (
+            (hicache_storage_prefetch_policy or cache.prefetch_stop_policy)
+            == "cost_aware"
+            and cache.host_memory_mode == "buffer_only"
+            and cache.pp_size > 1
+        ):
+            return False, "cost_aware does not support PP buffer_only prefetch tickets."
 
         controller = cache.cache_controller
         if controller is None:
@@ -443,6 +451,10 @@ class StorageAttachment:
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)
+        for handle in list(getattr(cache, "pending_prefetch_requests", {})):
+            cache.release_prefetch_capacity_waiter(handle)
+        getattr(cache, "_storage_prefetch_wait", {}).clear()
+        getattr(cache, "_cache_prefetch_io", {}).clear()
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()

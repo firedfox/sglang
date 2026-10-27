@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import atexit
+import json
 import logging
 import threading
 import time
 from array import array
-from dataclasses import replace
+from contextlib import nullcontext
+from dataclasses import asdict, replace
+from functools import partial
 from http import HTTPStatus
 from queue import Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
+import msgspec
 import torch
 
 from sglang.srt.distributed.communication_tags import P2PTag
@@ -55,6 +59,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.prefetch_cost import PrefetchCostModel
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -98,6 +103,12 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.observability.cache_observation import (
+    CacheNodeMutationHistory,
+    CacheRequestObservation,
+    SlowBackupMonitor,
+    cache_summary_json,
+)
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -105,6 +116,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_memory, get_model, get_observability
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheAck
@@ -161,6 +173,17 @@ class _OngoingLoadBack(NamedTuple):
     host_lock_params: DecLockRefParams
 
 
+class _StoragePrefetchWait(msgspec.Struct):
+    timer: PollTimer = msgspec.field(default_factory=PollTimer)
+    timeout_s: float = 0.0
+    expired: bool = False
+    stop_reason: str = "deadline"
+    progress_timer: PollTimer = msgspec.field(default_factory=PollTimer)
+    progress_operation_id: int = -1
+    progress_span: tuple[int, int] = (0, 0)
+    progress_start_tokens: int = 0
+
+
 class _OngoingPrefetch(NamedTuple):
     """Tracks an in-flight storage→host prefetch operation."""
 
@@ -187,6 +210,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_storage_metrics = False
         self.storage_metrics_collector: Optional[StorageMetricsCollector] = None
         self.extra_metric_labels = None
+        self.cache_observation_metrics = None
+        self._cache_observation_snapshot_at = 0.0
+        self.cache_observation_labels = {}
+        self.cache_observation_log_owner = False
+        self._cache_prefetch_io = {}
+        self._cache_load_observations = {}
+        self._slow_backup_monitor = None
 
         assert params.tree_components is not None
         self.tree_components = tuple(params.tree_components)
@@ -235,6 +265,10 @@ class UnifiedRadixCache(BasePrefixCache):
             params=tree_params,
             components=self.components,
         )
+        self.node_mutation_history = None
+        if isinstance(self.tree_core, UnifiedTreeCore):
+            self.node_mutation_history = CacheNodeMutationHistory()
+            self.tree_core.mutation_observer = self.node_mutation_history
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
             component.tree_core = self.tree_core
@@ -290,6 +324,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_threshold = 256
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
+        self.prefetch_cost_model: Optional[PrefetchCostModel] = None
         self.hicache_storage_pass_prefix_keys = False
         # Buffer-only host memory mode (host RAM as transient GPU↔storage
         # staging, not an L2 tier); resolved in init_hicache, which also
@@ -313,6 +348,8 @@ class UnifiedRadixCache(BasePrefixCache):
             "declined_unservable_prefix": 0,
             "revoked_insufficient": 0,
             "revoked_full_miss": 0,
+            "stopped_cost_aware": 0,
+            "stopped_deadline": 0,
             "l3_demand_requests": 0,
             "l3_miss_tokens": 0,
             "l1l2_miss_tokens": 0,
@@ -403,6 +440,13 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
+        self.pending_prefetch_requests: dict[CacheRequestHandle, int] = {}
+        self._cache_prefetch_io.clear()
+        self._cache_load_observations.clear()
+        self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
+        # Debug-only snapshots live for one IO attempt, unlike the request's
+        # sticky wait budget. Every removal from ongoing_prefetch drains them.
+        self._prefetch_cost_diagnostics: dict[int, dict] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
         # fails; buffer-mode entries survive staging until the H2D ack.
@@ -542,6 +586,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = get_memory().hicache_storage_prefetch_policy
+        self.prefetch_cost_model = PrefetchCostModel.from_json(
+            get_memory().hicache_storage_prefetch_cost_model
+        )
+
+        self._init_cache_observation(server_args)
 
         # Runtime attach/detach of the L3 backend (startup, admin API, atexit).
         atexit.register(self.shutdown)
@@ -556,6 +605,46 @@ class UnifiedRadixCache(BasePrefixCache):
                 enable_storage=self.cache_controller.enable_storage,
                 enable_storage_metrics=self._enable_metrics_flag,
                 extra_metric_labels=self.extra_metric_labels,
+            )
+            self._bind_storage_io_observer()
+
+    def _init_cache_observation(self, server_args: ServerArgs) -> None:
+        from sglang.srt.runtime_context import get_parallel
+
+        # Standalone CPU caches have no published distributed rank bundle.
+        # Production workers initialize their groups before constructing HiCache.
+        distributed = torch.distributed.is_initialized()
+        parallel = get_parallel() if distributed else None
+        self.cache_observation_labels = dict(
+            tp_rank=parallel.tp_rank if distributed else 0,
+            dp_rank=parallel.attn_dp_rank if distributed else 0,
+            pp_rank=self.pp_rank,
+            attn_cp_rank=parallel.attn_cp_rank if distributed else 0,
+        )
+        self.cache_observation_log_owner = True
+        self.cache_observation_log_rate = min(
+            1.0, max(0.0, envs.SGLANG_HICACHE_OBSERVATION_LOG_SAMPLE_RATE.get())
+        )
+        self._slow_backup_monitor = SlowBackupMonitor(
+            threshold=envs.SGLANG_HICACHE_SLOW_BACKUP_SECONDS.get(),
+            interval=envs.SGLANG_HICACHE_SLOW_BACKUP_LOG_INTERVAL_SECONDS.get(),
+        )
+        if self._enable_metrics_flag and self.cache_observation_metrics is None:
+            from sglang.srt.observability.cache_metrics import CacheMetricsCollector
+
+            labels = {"model_name": server_args.served_model_name}
+            labels.update(self.extra_metric_labels or {})
+            labels.update(self.cache_observation_labels)
+            self.cache_observation_metrics = CacheMetricsCollector(labels)
+        self._bind_storage_io_observer()
+
+    def _bind_storage_io_observer(self) -> None:
+        if self.cache_observation_metrics is None or self.cache_controller is None:
+            return
+        observer = getattr(self.cache_controller.storage_backend, "_io_observer", None)
+        if observer is not None:
+            observer.set_batch_observer(
+                self.cache_observation_metrics.observe_storage_batch
             )
 
     def register_sidecar_pool(
@@ -578,10 +667,24 @@ class UnifiedRadixCache(BasePrefixCache):
         same_results=["result.full_kv_hit_length", "result.swa_host_hit_length"],
     )
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
+        lookup_start = time.monotonic()
         result = self.session.try_match_prefix(params)
-        if result is not None:
-            return result
-        return self._match_tree(params)
+        if result is None:
+            result = self._match_tree(params)
+        if self.cache_controller is not None and params.req is not None:
+            obs = getattr(params.req, "cache_observation", None)
+            if obs is None:
+                obs = params.req.cache_observation = CacheRequestObservation()
+                obs.collector = self.cache_observation_metrics
+                obs.labels = dict(self.cache_observation_labels)
+                obs.log_owner = self.cache_observation_log_owner
+                obs.log_sample_rate = self.cache_observation_log_rate
+            obs.match(
+                len(result.device_indices),
+                result.host_hit_length,
+                time.monotonic() - lookup_start,
+            )
+        return result
 
     def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
@@ -1349,14 +1452,42 @@ class UnifiedRadixCache(BasePrefixCache):
             self.components[ct].free_host_values(host_frees.pop(ct))
 
     def evict_host(
-        self, num_tokens: int, component_type: ComponentType = BASE_COMPONENT_TYPE
+        self,
+        num_tokens: int,
+        component_type: ComponentType = BASE_COMPONENT_TYPE,
+        *,
+        caller: str = "unspecified",
+        allocation_tokens: int | None = None,
+        host_free_before: int | None = None,
+        trigger_rid: str | None = None,
+        trigger_node_id: NodeId | None = None,
     ) -> int:
         """Evict host resources for a specific component to free host pool space."""
         if self.host_memory_mode == "buffer_only":
-            # The tree never holds host values in buffer mode, and staging
-            # is operation-owned (freed at each ack): nothing is evictable.
             return 0
-        result = self.tree_core.drive_host_eviction(component_type, num_tokens)
+        if (
+            host_free_before is None
+            and component_type == BASE_COMPONENT_TYPE
+            and self.cache_controller is not None
+        ):
+            host_free_before = self.cache_controller.mem_pool_host.available_size()
+        history = self.node_mutation_history
+        if history is not None:
+            context = history.eviction_context(
+                caller=caller,
+                allocation_tokens=(
+                    num_tokens if allocation_tokens is None else allocation_tokens
+                ),
+                requested_evict_tokens=num_tokens,
+                host_free_before=host_free_before,
+                component=str(component_type),
+                trigger_rid=trigger_rid,
+                trigger_node_id=trigger_node_id,
+            )
+        else:
+            context = nullcontext()
+        with context:
+            result = self.tree_core.drive_host_eviction(component_type, num_tokens)
         self._free_values(result.device_frees, result.host_frees)
         return result.tracker.get(component_type, 0)
 
@@ -1467,7 +1598,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _reclaim_retraction_host(self, num_tokens: int) -> int:
         if self.disable:
             return 0
-        return self.evict_host(num_tokens)
+        return self.evict_host(
+            num_tokens, caller="retraction_backup", allocation_tokens=num_tokens
+        )
 
     def backup_kv_cache(self, req: Req) -> Optional[RetractionBackup]:
         """Back up device KV to the host pool; None when it cannot fit after reclaim."""
@@ -1663,7 +1796,16 @@ class UnifiedRadixCache(BasePrefixCache):
             host_avail = self.cache_controller.mem_pool_host.available_size()
             if host_avail < kv_tokens:
                 needed = kv_tokens - host_avail
-                if self.evict_host(needed) < needed:
+                if (
+                    self.evict_host(
+                        needed,
+                        caller="device_backup",
+                        allocation_tokens=kv_tokens,
+                        host_free_before=host_avail,
+                        trigger_node_id=node_id,
+                    )
+                    < needed
+                ):
                     return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
@@ -1738,6 +1880,10 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.cache_controller is None:
             return False
 
+        observation = getattr(req, "cache_observation", None)
+        if observation is not None:
+            observation.wait_start("restore", time.monotonic())
+
         host_anchor_params = self.inc_host_lock_ref(node_id).to_dec_params()
 
         # Lock the path before building transfers (the aux build can evict).
@@ -1762,6 +1908,11 @@ class UnifiedRadixCache(BasePrefixCache):
             )
             return success
         finally:
+            if observation is not None:
+                if success:
+                    self._cache_load_observations[node_id] = observation
+                else:
+                    observation.wait_end("restore", time.monotonic())
             for comp in self._components_tuple:
                 comp.finalize_load_back(req, preps[comp.component_type], success)
 
@@ -1988,6 +2139,15 @@ class UnifiedRadixCache(BasePrefixCache):
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
 
+    def prefetch_capacity_pending_tokens(self, request: CacheRequestHandle) -> int:
+        return getattr(self, "pending_prefetch_requests", {}).get(request, 0)
+
+    def release_prefetch_capacity_waiter(self, request: CacheRequestHandle) -> None:
+        getattr(self, "pending_prefetch_requests", {}).pop(request, None)
+        cc = self.cache_controller
+        if cc is not None and getattr(cc, "prefetch_capacity_retry", False):
+            cc.release_prefetch_capacity_waiter(request.rid)
+
     @rank_consensus(same_params=["request.rid", "len(new_input_tokens)"])
     def prefetch_from_storage(
         self,
@@ -2006,6 +2166,10 @@ class UnifiedRadixCache(BasePrefixCache):
 
         req_id = request.rid
         self.storage_prefetch_retries.cancel(req_id)
+        wait = self._storage_prefetch_wait.get(request)
+        if wait is not None and wait.expired:
+            self.release_prefetch_capacity_waiter(request)
+            return
         submission = self.cache_controller.get_prefetch_submission(req_id)
         if submission is not None:
             return submission.decision
@@ -2056,16 +2220,38 @@ class UnifiedRadixCache(BasePrefixCache):
         if prefetch_length > 0:
             stats["attempts"] += 1
         if prefetch_length < self.prefetch_threshold:
+            self.release_prefetch_capacity_waiter(request)
             if prefetch_length > 0:
                 stats["declined_too_short"] += 1
             # No lookup was issued, so no retry is armed: polling here would
             # spend the re-issue budget the admission-time device-hit-loss
             # re-query needs once the device match evicts while queued.
             return
-        if not buffer_mode and self.cache_controller.prefetch_rate_limited():
+        capacity_retry = not buffer_mode and getattr(
+            self.cache_controller, "prefetch_capacity_retry", False
+        )
+        if (
+            capacity_retry
+            and prefetch_length > self.cache_controller.prefetch_capacity_limit
+        ):
+            # An over-limit request can never become a FIFO waiter.
+            stats["declined_host_oversize"] += 1
+            self.release_prefetch_capacity_waiter(request)
+            return
+        limited = not buffer_mode and (
+            self.cache_controller.prefetch_rate_limited(prefetch_length, req_id)
+            if capacity_retry
+            else self.cache_controller.prefetch_rate_limited()
+        )
+        if limited:
             stats["declined_rate_limited"] += 1
-            # Paced: the limiter clears as transfers finish, not on the next pass.
-            self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
+            if capacity_retry:
+                if not hasattr(self, "pending_prefetch_requests"):
+                    self.pending_prefetch_requests = {}
+                self.pending_prefetch_requests[request] = prefetch_length
+            else:
+                # Preserve release paced retry behavior when exact FIFO is off.
+                self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
 
         # Buffer mode holds no tree state during the fetch: buffers are
@@ -2128,6 +2314,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         operation = submission.operation
         if operation is None:
+            self.release_prefetch_capacity_waiter(request)
             assert submission.decision is not None
             self.cache_controller.append_host_mem_release(extra_pools=aux_xfers or None)
             return submission.decision
@@ -2138,6 +2325,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Snapshot the requested span for L3 miss-token accounting at the
         # rank-synchronized query outcome.
         operation.stats_requested_tokens = prefetch_length
+        if hasattr(self, "_cache_prefetch_io"):
+            self._cache_prefetch_io[operation.id] = operation
         operation.storage_start = storage_start
         if submission.decision is not None:
             return submission.decision
@@ -2163,13 +2352,235 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode reserves the requested span up front; buffer mode
             # grants occupancy later at hit-alloc time, sized to the hit.
             self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+        if capacity_retry:
+            self.pending_prefetch_requests.pop(request, None)
+            self.cache_controller.prefetch_capacity_waiter_started(req_id)
 
-    def _prefetch_timeout_check_linear_func(self, operation: PrefetchOperation) -> bool:
-        return (
-            time.monotonic() - operation.start_time
-            > self.prefetch_timeout_base
-            + len(operation.hash_value) * self.prefetch_timeout_per_page
+    def _observe_prefetch(
+        self, operation: PrefetchOperation, local=0, synced=0, duplicate=0, reason=None
+    ) -> None:
+        obs = getattr(operation, "cache_observation", None)
+        if obs is None:
+            return
+        reason = reason or obs.reason
+        if reason in ("complete", "host_allocation_truncated") and (
+            local < obs.tokens.get("allocated", 0) or operation.host_indices is None
+        ):
+            reason = getattr(obs, "stop_reason", "get_partial")
+        if obs.finish(local, synced, duplicate, reason):
+            if reason == "host_insert_dropped":
+                obs.final_tokens["inserted"] = 0
+                obs.losses[reason] = obs.losses.get(reason, 0) + synced
+            if getattr(self, "cache_observation_metrics", None) is not None:
+                self.cache_observation_metrics.observe_operation(obs)
+
+    def _start_storage_prefetch_wait(self, operation: PrefetchOperation) -> None:
+        if (
+            self.prefetch_stop_policy in ("timeout", "cost_aware")
+            and operation.handle not in self._storage_prefetch_wait
+        ):
+            # Start at the first blocked admission poll; refetches keep this budget.
+            pages = operation.stats_requested_tokens // self.page_size
+            wait = _StoragePrefetchWait(
+                timeout_s=self.prefetch_timeout_base
+                + pages * self.prefetch_timeout_per_page,
+            )
+            wait.timer.observe(ready=False)
+            self._storage_prefetch_wait[operation.handle] = wait
+
+        if self.prefetch_stop_policy == "cost_aware":
+            wait = self._storage_prefetch_wait[operation.handle]
+            self._observe_prefetch_progress(operation, wait)
+
+    def _observe_prefetch_progress(
+        self, operation: PrefetchOperation, wait: _StoragePrefetchWait
+    ) -> None:
+        if operation.host_indices is None or not operation.hash_value:
+            return
+        span = (operation.storage_start, len(operation.hash_value) * self.page_size)
+        if wait.progress_operation_id != operation.id or wait.progress_span != span:
+            # Refetches and device-prefix trims change what progress means. Start
+            # a fresh sample, but retain the original request's timeout budget.
+            wait.progress_operation_id = operation.id
+            wait.progress_span = span
+            wait.progress_start_tokens = operation.completed_tokens
+            wait.progress_timer = PollTimer()
+            wait.progress_timer.observe(ready=False)
+
+    def _prefetch_cost_exceeds_recompute(self, operation: PrefetchOperation) -> bool:
+        model = self.prefetch_cost_model
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        expected_tokens = len(operation.hash_value) * self.page_size
+        diagnostic = self._prefetch_cost_diagnostic_state(operation)
+        if (
+            model is None
+            or wait is None
+            or operation.host_indices is None
+            or operation.completed_tokens >= expected_tokens
+        ):
+            # Unknown query results have no reliable remaining read size. When
+            # KV has already landed, only sidecars remain and cancellation would
+            # discard useful work without an estimate for those separate pools.
+            if diagnostic is not None:
+                diagnostic["last_poll_reason"] = (
+                    "missing_model"
+                    if model is None
+                    else "wait_not_started"
+                    if wait is None
+                    else "query_pending"
+                    if operation.host_indices is None
+                    else "kv_complete_waiting_sidecars"
+                )
+                diagnostic["fallback_reason"] = diagnostic["last_poll_reason"]
+            return False
+
+        self._observe_prefetch_progress(operation, wait)
+        remaining_tokens = expected_tokens - operation.completed_tokens
+        # SWA/Mamba and other independent pools are all-or-nothing. Their
+        # partial KV prefix cannot be credited as retained recomputation work.
+        all_or_nothing = any(
+            transfer.indices_from_pool != PoolName.KV
+            for transfer in operation.pool_transfers or ()
         )
+        recompute_tokens = remaining_tokens
+        if all_or_nothing:
+            # A buffer-mode FULL-head trim can leave device KV whose independent
+            # state is still missing. That head is not a jointly reusable prefix
+            # on cancellation, so include the original sidecar span as well.
+            recompute_tokens = max(
+                expected_tokens,
+                len(operation.sidecar_hash_values or ()) * self.page_size,
+            )
+        observed_tokens = operation.completed_tokens - wait.progress_start_tokens
+        observation_seconds = wait.progress_timer.elapsed()
+        estimate = model.estimate(
+            remaining_tokens=remaining_tokens,
+            recompute_tokens=recompute_tokens,
+            observed_tokens=observed_tokens,
+            observation_seconds=observation_seconds,
+        )
+        if diagnostic is not None:
+            diagnostic["last_evaluation"] = model.describe_estimate(
+                estimate,
+                remaining_tokens=remaining_tokens,
+                recompute_tokens=recompute_tokens,
+                observed_tokens=observed_tokens,
+                observation_seconds=observation_seconds,
+            )
+            diagnostic["last_poll_reason"] = diagnostic["last_evaluation"]["reason"]
+            diagnostic["fallback_reason"] = (
+                diagnostic["last_poll_reason"] if estimate is None else None
+            )
+        return estimate is not None and estimate.should_cancel
+
+    def _prefetch_cost_diagnostic_state(
+        self, operation: PrefetchOperation
+    ) -> Optional[dict]:
+        if getattr(
+            self, "prefetch_stop_policy", None
+        ) != "cost_aware" or not logger.isEnabledFor(logging.DEBUG):
+            return None
+        diagnostics = getattr(self, "_prefetch_cost_diagnostics", None)
+        if diagnostics is None:
+            diagnostics = self._prefetch_cost_diagnostics = {}
+        return diagnostics.setdefault(operation.id, {})
+
+    def _note_prefetch_terminal_reason(
+        self, request: CacheRequestHandle, reason: Optional[str]
+    ) -> None:
+        if getattr(
+            self, "prefetch_stop_policy", None
+        ) != "cost_aware" or not logger.isEnabledFor(logging.DEBUG):
+            return
+        info = self.ongoing_prefetch.get(request)
+        if info is not None and reason is not None:
+            diagnostic = self._prefetch_cost_diagnostic_state(info.operation)
+            if diagnostic is not None:
+                # A subsequent generic revoke must not hide the original cause.
+                diagnostic.setdefault("unfulfilled_reason", reason)
+
+    def _log_prefetch_cost_decision(
+        self, operation: PrefetchOperation, *, terminal: str
+    ) -> None:
+        """Consume one attempt's diagnostic at its existing terminal boundary."""
+        diagnostics = getattr(self, "_prefetch_cost_diagnostics", None)
+        diagnostic = diagnostics.pop(operation.id, {}) if diagnostics else {}
+        if getattr(
+            self, "prefetch_stop_policy", None
+        ) != "cost_aware" or not logger.isEnabledFor(logging.DEBUG):
+            return
+        model = self.prefetch_cost_model
+        independent_pools = [
+            getattr(transfer.name, "value", str(transfer.name))
+            for transfer in operation.pool_transfers or ()
+            if transfer.indices_from_pool != PoolName.KV
+        ]
+        logger.debug(
+            "HiCache prefetch cost decision %s",
+            json.dumps(
+                {
+                    "request_id": operation.handle.rid,
+                    "attempt_id": operation.id,
+                    "terminal": terminal,
+                    "storage_start": operation.storage_start,
+                    "requested_tokens": operation.stats_requested_tokens,
+                    "completed_tokens": operation.completed_tokens,
+                    "expected_tokens": len(operation.hash_value) * self.page_size,
+                    "sidecar_span_tokens": (
+                        len(operation.sidecar_hash_values or ()) * self.page_size
+                    ),
+                    "reuse_mode": (
+                        "all_or_nothing" if independent_pools else "partial"
+                    ),
+                    "independent_pools": independent_pools,
+                    "configured_model": asdict(model) if model is not None else None,
+                    "last_poll_reason": diagnostic.get(
+                        "last_poll_reason", "not_evaluated"
+                    ),
+                    "last_evaluation": diagnostic.get("last_evaluation"),
+                    "fallback_reason": diagnostic.get(
+                        "fallback_reason", "not_evaluated"
+                    ),
+                    "local_vote": diagnostic.get("local_vote", "not_evaluated"),
+                    "agreed_stop_reason": diagnostic.get("agreed_stop_reason"),
+                    "unfulfilled_reason": diagnostic.get("unfulfilled_reason"),
+                },
+                sort_keys=True,
+            ),
+        )
+
+    def _prefetch_deadline_expired(self, operation: PrefetchOperation) -> bool:
+        if operation.host_indices is not None and (
+            operation.completed_tokens >= len(operation.hash_value) * self.page_size
+        ):
+            # KV landed: cutting the pending sidecar read would salvage nothing.
+            return False
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        return wait is not None and (
+            wait.expired
+            or (wait.timer.running and wait.timer.elapsed() > wait.timeout_s)
+        )
+
+    def _mark_prefetch_deadline_expired(self, operation: PrefetchOperation) -> None:
+        operation.deadline_expired = True
+        self.storage_prefetch_retries.cancel(operation.handle.rid)
+        # Only a rank-agreed verdict can suppress retries, including on peers
+        # that have not reached their conditional admission poll yet.
+        wait = self._storage_prefetch_wait.setdefault(
+            operation.handle, _StoragePrefetchWait()
+        )
+        if not wait.expired:
+            counter = f"stopped_{wait.stop_reason}"
+            self._prefetch_outcome_stats[counter] = (
+                self._prefetch_outcome_stats.get(counter, 0) + 1
+            )
+        wait.expired = True
+
+    def _prefetch_stop_reason(self, operation: PrefetchOperation) -> str:
+        if not operation.deadline_expired:
+            return "storage_transfer"
+        wait = self._storage_prefetch_wait.get(operation.handle)
+        return wait.stop_reason if wait is not None else "deadline"
 
     @rank_consensus(same_results=True)
     def _can_terminate_prefetch(self, operation: PrefetchOperation) -> bool:
@@ -2179,17 +2590,58 @@ class UnifiedRadixCache(BasePrefixCache):
             # Completion is committed by the ACK drain (sync-thread MIN-reduced
             # progress, rank-min queue drain); a vote here only adds collectives.
             return False
-        if self.prefetch_stop_policy == "timeout":
+        if self.prefetch_stop_policy in ("timeout", "cost_aware"):
             # Wall clocks differ across ranks: PP0 decides, TP takes MAX (any
-            # rank timed out) and _all_reduce broadcasts the verdict along PP.
-            should_terminate = False
+            # rank stops) and _all_reduce broadcasts the verdict along PP.
+            # 0 = keep waiting, 1 = cost, 2 = deadline; a deadline wins ties.
+            stop_reason = 0
+            diagnostic = None
             if self.pp_rank == 0:
-                should_terminate = self._prefetch_timeout_check_linear_func(operation)
+                wait = self._storage_prefetch_wait.get(operation.handle)
+                if wait is not None and wait.expired:
+                    # Keep the first agreed reason while cancellation ACKs drain;
+                    # a later wall-clock timeout must not relabel a cost stop.
+                    stop_reason = 1 if wait.stop_reason == "cost_aware" else 2
+                elif self._prefetch_deadline_expired(operation):
+                    stop_reason = 2
+                elif (
+                    self.prefetch_stop_policy == "cost_aware"
+                    and self._prefetch_cost_exceeds_recompute(operation)
+                ):
+                    stop_reason = 1
+                diagnostic = self._prefetch_cost_diagnostic_state(operation)
+                if diagnostic is not None and not diagnostic.get("agreed_stop_reason"):
+                    diagnostic["local_vote"] = (
+                        "replayed_agreed_stop"
+                        if wait is not None and wait.expired
+                        else ("keep_waiting", "cost_aware", "deadline")[stop_reason]
+                    )
+                    if stop_reason == 2:
+                        diagnostic["last_poll_reason"] = "deadline"
+            else:
+                diagnostic = self._prefetch_cost_diagnostic_state(operation)
+                if diagnostic is not None:
+                    diagnostic.setdefault("local_vote", "pp_follower")
             should_terminate_tensor = torch.tensor(
-                int(should_terminate), dtype=torch.int, device="cpu"
+                stop_reason, dtype=torch.int, device="cpu"
             )
             self._all_reduce(should_terminate_tensor, torch.distributed.ReduceOp.MAX)
-            return should_terminate_tensor.item() == 1
+            stop_reason = should_terminate_tensor.item()
+            if diagnostic is not None and stop_reason:
+                # Preserve the original local vote when another rank stopped;
+                # cancellation-drain polls replay the common reason afterwards.
+                diagnostic.setdefault(
+                    "agreed_stop_reason",
+                    "cost_aware" if stop_reason == 1 else "deadline",
+                )
+            if stop_reason:
+                # Adopt the reason even when this rank has no local timer yet.
+                wait = self._storage_prefetch_wait.setdefault(
+                    operation.handle, _StoragePrefetchWait()
+                )
+                if not wait.expired:
+                    wait.stop_reason = "cost_aware" if stop_reason == 1 else "deadline"
+            return stop_reason != 0
         return True
 
     def has_ongoing_prefetch(self, handle: CacheRequestHandle) -> bool:
@@ -2264,17 +2716,21 @@ class UnifiedRadixCache(BasePrefixCache):
 
         operation = self.ongoing_prefetch[request].operation
 
-        # Determine whether or not we should terminate this prefetch request.
-        should_terminate = operation.is_terminated() or self._can_terminate_prefetch(
-            operation
-        )
-
-        if not should_terminate:
-            return False
+        if not operation.is_terminated():
+            if not self._can_terminate_prefetch(operation):
+                self._start_storage_prefetch_wait(operation)
+                return False
+            if self.prefetch_stop_policy in ("timeout", "cost_aware"):
+                self._mark_prefetch_deadline_expired(operation)
 
         self.cache_controller.terminate_prefetch(operation)
         if operation.host_indices is None:
-            self.storage_prefetch_retries.poll_miss(request.rid)
+            if operation.deadline_expired:
+                self._finish_storage_prefetch(
+                    request, 0, reason=self._prefetch_stop_reason(operation)
+                )
+            else:
+                self.storage_prefetch_retries.poll_miss(request.rid)
             self.revoke_pending_prefetch(request)
         else:
             self._handle_prefetch_result(operation)
@@ -2314,7 +2770,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request,
                 allocated_tokens - completed_tokens,
-                reason="storage_transfer",
+                reason=self._prefetch_stop_reason(operation),
             )
         if (
             completed_tokens > 0
@@ -2326,9 +2782,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.buffer_pipeline is not None:
             # No graft: release the rank-local tail beyond the synced usable
             # length, then park the bounce for admission-time consumption.
-            return self.buffer_pipeline.stage_completed_prefetch(
+            result = self.buffer_pipeline.stage_completed_prefetch(
                 request, completed_tokens, hash_value
             )
+            self._observe_prefetch(
+                operation,
+                local=operation.cache_observation.tokens.get(
+                    "completed_local", completed_tokens
+                ),
+                synced=completed_tokens,
+                reason=self._prefetch_stop_reason(operation)
+                if operation.deadline_expired
+                else None,
+            )
+            self._log_prefetch_cost_decision(operation, terminal="buffer_stage")
+            return result
 
         fetched_key = prefetch_key[:completed_tokens]
         insert_result = self.tree_core.insert_host(
@@ -2374,6 +2842,27 @@ class UnifiedRadixCache(BasePrefixCache):
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
+        self._observe_prefetch(
+            operation,
+            local=operation.cache_observation.tokens.get(
+                "completed_local", completed_tokens
+            ),
+            synced=completed_tokens,
+            duplicate=insert_result.prefix_len,
+            reason="host_insert_dropped"
+            if insert_result.host_insert_dropped
+            else self._prefetch_stop_reason(operation)
+            if operation.deadline_expired
+            else None,
+        )
+        self._log_prefetch_cost_decision(
+            operation,
+            terminal=(
+                "cache_insert_dropped"
+                if insert_result.host_insert_dropped
+                else "cache_inserted"
+            ),
+        )
         self.cache_controller.prefetch_tokens_occupied -= len(prefetch_key)
 
         self.prefetch_loaded_tokens_by_reqid[request] = loaded_from_storage
@@ -2451,7 +2940,7 @@ class UnifiedRadixCache(BasePrefixCache):
             trimmed_pages = len(invalidation_hashes) - len(hash_value)
             keep_pages = trimmed_pages + completed_tokens // self.page_size
             beliefs = self.storage_existence_cache
-            if keep_pages < len(invalidation_hashes):
+            if not operation.deadline_expired and keep_pages < len(invalidation_hashes):
                 self._belief_policy(
                     PoolName.KV, PoolHitPolicy.ALL_PAGES
                 ).heal_from_transfer(
@@ -2467,15 +2956,18 @@ class UnifiedRadixCache(BasePrefixCache):
                             keep_pages,
                         )
             for transfer, count in zip(pool_transfers, pool_hit_pages):
-                if transfer.keys is not None and count < len(transfer.keys):
+                if (
+                    not operation.deadline_expired
+                    and transfer.keys is not None
+                    and count < len(transfer.keys)
+                ):
                     self._belief_policy(
                         transfer.name, transfer.hit_policy
                     ).heal_from_transfer(
                         beliefs.pool(transfer.name), transfer.keys, count
                     )
-            self._finish_storage_prefetch(
-                request, fulfilled_tokens=0, reason="storage_transfer"
-            )
+            reason = self._prefetch_stop_reason(operation)
+            self._finish_storage_prefetch(request, fulfilled_tokens=0, reason=reason)
             # The controller's prefetch IO thread already releases the untransferred
             # tail (host_indices[completed_tokens:])
             self._retire_ongoing_prefetch(
@@ -2487,11 +2979,11 @@ class UnifiedRadixCache(BasePrefixCache):
             self.prefetch_loaded_storage_start_by_reqid.pop(request, None)
             logger.warning(
                 "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d "
-                "kv_beliefs_kept_pages=%d aux_pool_hit_pages=%s",
+                "kv_beliefs_kept_pages=%s aux_pool_hit_pages=%s",
                 request.rid,
                 completed_tokens,
                 expected_tokens,
-                keep_pages,
+                None if operation.deadline_expired else keep_pages,
                 {
                     getattr(transfer.name, "value", transfer.name): count
                     for transfer, count in zip(pool_transfers, pool_hit_pages)
@@ -2552,6 +3044,12 @@ class UnifiedRadixCache(BasePrefixCache):
     def _finish_storage_prefetch(
         self, request: CacheRequestHandle, fulfilled_tokens: int, reason: Optional[str]
     ) -> None:
+        self._note_prefetch_terminal_reason(request, reason)
+        info = self.ongoing_prefetch.get(request)
+        if info is not None and reason is not None:
+            obs = getattr(info.operation, "cache_observation", None)
+            if obs is not None and not hasattr(obs, "stop_reason"):
+                obs.stop_reason = reason
         remaining = self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
         if remaining is None:
             return
@@ -2588,11 +3086,12 @@ class UnifiedRadixCache(BasePrefixCache):
         Buffer mode resolves at the H2D completion ack instead, because its
         host allocation is transport staging rather than a resident L2 hit.
         """
+        self._storage_prefetch_wait.pop(request, None)
         if self.host_memory_mode == "cache":
             self._finish_storage_prefetch(request, fulfilled_tokens, reason)
 
     def discard_storage_prefetch_accounting(self, request: CacheRequestHandle) -> None:
-        """Drop lifecycle state for cases intentionally excluded from metrics."""
+        """Drop metric state without reopening the request admission wait budget."""
         self._storage_prefetch_hit_remaining_by_reqid.pop(request, None)
 
     def _handle_storage_prefetch_anchor_loss(self, request: CacheRequestHandle) -> None:
@@ -2624,6 +3123,9 @@ class UnifiedRadixCache(BasePrefixCache):
     @rank_consensus(same_params=True)
     def release_aborted_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        self.release_prefetch_capacity_waiter(request)
+        self._note_prefetch_terminal_reason(request, "request_aborted")
+        self._storage_prefetch_wait.pop(request, None)
         if self.linker is not None:
             self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(request, None)
@@ -2669,6 +3171,18 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         """Drop an in-flight prefetch, releasing ``host_indices`` and ``extra_pools``."""
         info = self.ongoing_prefetch.pop(request)
+        self._observe_prefetch(
+            info.operation,
+            local=getattr(info.operation, "completed_tokens", 0),
+            reason=self._prefetch_stop_reason(info.operation)
+            if getattr(info.operation, "deadline_expired", False)
+            else getattr(
+                getattr(info.operation, "cache_observation", None),
+                "stop_reason",
+                "cancelled",
+            ),
+        )
+        self._log_prefetch_cost_decision(info.operation, terminal="retired")
         if info.anchor_lock_params is not None:
             self.dec_host_lock_ref(info.anchor_node_id, info.anchor_lock_params)
         if self.buffer_pipeline is not None:
@@ -2699,7 +3213,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Heal each pool's beliefs beyond its rank-agreed boundary (a
         chain-page pool also learns presence up to it); a pool without a
         verdict heals from the folded cut."""
-        if self.host_memory_mode != "buffer_only":
+        if self.host_memory_mode != "buffer_only" or operation.deadline_expired:
             return
         chain = operation.all_hash_values
         if chain is None:
@@ -2730,7 +3244,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Feed the cumulative prefetch-outcome counters at the (rank-synced)
         query outcome: T = prompt tokens, L = requested, m = L3-miss."""
         requested = operation.stats_requested_tokens
-        if requested <= 0:
+        if requested <= 0 or operation.deadline_expired:
             return
         stats = self._prefetch_outcome_stats
         hit = max(0, min(operation.storage_hit_count, requested))
@@ -2958,12 +3472,23 @@ class UnifiedRadixCache(BasePrefixCache):
                     operation, info, hit_tokens, aux_hit_tokens
                 )
             aux_hit_tokens = hit_tokens
+            obs = operation.cache_observation
+            obs.pressure = dict(
+                host_free_before=cc.mem_pool_host.available_size(),
+                prefetch_budget_used=cc.prefetch_tokens_occupied,
+            )
             host_indices, alloc_len = cc.allocate_storage_hit(
                 operation,
                 hit_tokens,
                 allow_partial=True,
                 min_tokens=self.prefetch_threshold,
-                evict_host=self.evict_host,
+                evict_host=partial(
+                    self.evict_host,
+                    caller="l3_prefetch_allocation",
+                    allocation_tokens=hit_tokens,
+                    host_free_before=obs.pressure["host_free_before"],
+                    trigger_rid=request.rid,
+                ),
             )
             if host_indices is None:
                 self._finish_storage_prefetch(
@@ -2995,9 +3520,13 @@ class UnifiedRadixCache(BasePrefixCache):
             self._resolve_storage_prefetch_tokens(
                 request, hit_tokens - alloc_len, reason="host_capacity"
             )
+            if alloc_len < operation.storage_hit_count:
+                obs.reason = "host_allocation_truncated"
             operation.storage_hit_count = alloc_len
             operation.hash_value = operation.hash_value[: alloc_len // self.page_size]
             operation.host_indices = host_indices
+            operation.cache_observation.tokens["allocated"] = alloc_len
+            operation.cache_observation.mark("allocated")
             self.ongoing_prefetch[request] = info._replace(host_indices=host_indices)
             cc.prefetch_buffer.put(operation)
             return True
@@ -3027,19 +3556,21 @@ class UnifiedRadixCache(BasePrefixCache):
                     # Controller-side miss termination (retryable) or an abort
                     # race (abort cleanup discards the marker).
                     if hit_tokens > 0:
+                        reason = None
+                        if operation.deadline_expired:
+                            reason = self._prefetch_stop_reason(operation)
+                        elif hit_tokens < self.prefetch_threshold:
+                            reason = "below_threshold"
                         self._finish_storage_prefetch(
                             request,
                             fulfilled_tokens=0,
-                            reason=(
-                                "below_threshold"
-                                if hit_tokens < self.prefetch_threshold
-                                else None
-                            ),
+                            reason=reason,
                         )
                     # The published (rank-agreed) hit count is the L3 verdict;
                     # without this, store misses never reach l3_miss_tokens.
                     self._account_prefetch_outcome(operation, revoked=True)
-                    self.storage_prefetch_retries.poll_miss(request.rid)
+                    if not operation.deadline_expired:
+                        self.storage_prefetch_retries.poll_miss(request.rid)
                     self.revoke_pending_prefetch(request)
                     continue
                 if hit_tokens < self.prefetch_threshold:
@@ -3097,6 +3628,20 @@ class UnifiedRadixCache(BasePrefixCache):
             drained = 0
             for operation in _drain_queue(cc.ack_backup_queue, n_backup):
                 drained += 1
+                obs = operation.cache_observation
+                finalized = obs.finish(
+                    operation.completed_tokens,
+                    operation.completed_tokens,
+                    0,
+                    "complete"
+                    if operation.completed_tokens == obs.requested
+                    else "put_partial",
+                )
+                if (
+                    finalized
+                    and getattr(self, "cache_observation_metrics", None) is not None
+                ):
+                    self.cache_observation_metrics.observe_operation(obs, "backup")
                 if buffer_mode:
                     # Storage write acked: free the staging.
                     self.buffer_pipeline.finish_storage_write_ack(operation.id)
@@ -3226,13 +3771,16 @@ class UnifiedRadixCache(BasePrefixCache):
                 "HiCache is not initialized; launch with "
                 "--enable-hierarchical-cache to attach a storage backend.",
             )
-        return self._storage_attachment.attach(
+        result = self._storage_attachment.attach(
             storage_backend=storage_backend,
             storage_backend_extra_config_json=storage_backend_extra_config_json,
             served_model_name=served_model_name,
             hicache_storage_prefetch_policy=hicache_storage_prefetch_policy,
             hicache_write_policy=hicache_write_policy,
         )
+        if result[0]:
+            self._bind_storage_io_observer()
+        return result
 
     def detach_storage_backend(self) -> tuple[bool, str]:
         """Detach (disable) the HiCache storage backend at runtime."""
@@ -3370,6 +3918,15 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
         """Record D->H backup volume and duration for a completed write ack."""
+        duration_seconds = (
+            ack.start_event.elapsed_time(ack.finish_event) / 1000.0
+            if ack.timing_enabled
+            else None
+        )
+        if self.cache_observation_metrics is not None:
+            self.cache_observation_metrics.observe_transfer(
+                "l1_to_l2", ack.num_tokens_by_pool, ack.num_bytes, duration_seconds
+            )
         if self.metrics_collector is None:
             return
         for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -3380,8 +3937,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if ack.num_bytes > 0:
             self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
         if ack.timing_enabled:
-            duration_ms = ack.start_event.elapsed_time(ack.finish_event)
-            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
+            self.metrics_collector.observe_backup_duration(duration_seconds)
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
@@ -3420,7 +3976,19 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.dec_host_lock_ref(node, host_lock_params)
                 # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
                 self.tree_core.finish_load_back(node)
+                observation = self._cache_load_observations.pop(node, None)
+                if observation is not None:
+                    observation.wait_end("restore", time.monotonic())
 
+            duration_seconds = (
+                ack.start_event.elapsed_time(ack.finish_event) / 1000.0
+                if ack.timing_enabled
+                else None
+            )
+            if self.cache_observation_metrics is not None:
+                self.cache_observation_metrics.observe_transfer(
+                    "l2_to_l1", ack.num_tokens_by_pool, ack.num_bytes, duration_seconds
+                )
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
                     if num_tokens > 0:
@@ -3430,10 +3998,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if ack.num_bytes > 0:
                     self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
-                    duration_ms = ack.start_event.elapsed_time(ack.finish_event)
-                    self.metrics_collector.observe_load_back_duration(
-                        duration_ms / 1000.0
-                    )
+                    self.metrics_collector.observe_load_back_duration(duration_seconds)
             finish_count -= 1
 
     # ---- HiCache: Scheduler Entry Points ----
@@ -3558,9 +4123,59 @@ class UnifiedRadixCache(BasePrefixCache):
             storage_metrics = self.cache_controller.storage_backend.get_stats()
             if storage_metrics is None:
                 storage_metrics = StorageMetrics()
-            if not hasattr(storage_metrics, "prefetch_stats"):
-                storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
+            # This field belongs to the controller. Refresh it even when a
+            # backend reuses its StorageMetrics instance across polls.
+            storage_metrics.prefetch_stats = self.prefetch_outcome_stats_snapshot()
             self.storage_metrics_collector.log_storage_metrics(storage_metrics)
+            if self.cache_observation_metrics is not None:
+                self.cache_observation_metrics.observe_storage(storage_metrics)
+        self._reap_prefetch_io()
+        self._log_slow_backup()
+        collector = self.cache_observation_metrics
+        now = time.monotonic()
+        if collector is not None and now - self._cache_observation_snapshot_at >= 1.0:
+            self._cache_observation_snapshot_at = now
+            if hasattr(self.tree_core, "host_protected_full_tokens"):
+                tokens, references = self.tree_core.host_protected_full_tokens()
+                collector.snapshot_unified_host(
+                    tokens,
+                    self.cache_controller.mem_pool_host.get_pool(
+                        PoolName.KV
+                    ).get_size_per_token(),
+                    references,
+                    self.cache_controller.write_policy,
+                )
+            collector.snapshot_unified_runtime(self)
+
+    def _reap_prefetch_io(self) -> None:
+        for operation_id, operation in list(self._cache_prefetch_io.items()):
+            obs = operation.cache_observation
+            if (
+                obs.finalized
+                and "allocated" not in obs.times
+                and operation.host_indices is None
+            ):
+                del self._cache_prefetch_io[operation_id]
+                continue
+            if "get_done" not in obs.times or not obs.finalized:
+                continue
+            if self.cache_observation_metrics is not None:
+                self.cache_observation_metrics.duration.labels(
+                    **self.cache_observation_metrics.labels,
+                    operation="prefetch",
+                    stage="get",
+                ).observe(obs.durations()["get"])
+            del self._cache_prefetch_io[operation_id]
+
+    def _log_slow_backup(self) -> None:
+        if not self.enable_storage or self._slow_backup_monitor is None:
+            return
+        data = self._slow_backup_monitor.poll(self.cache_controller)
+        if data is None:
+            return
+        data.update(self.cache_observation_labels)
+        data["host_free_tokens"] = self.cache_controller.mem_pool_host.available_size()
+        logger.warning("HiCache slow_backup %s", cache_summary_json(data))
 
     def flush_pending_backups(self) -> None:
         """Submit pending D2H backups as a merged operation."""

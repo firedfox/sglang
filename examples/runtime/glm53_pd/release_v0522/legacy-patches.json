@@ -1,0 +1,516 @@
+{
+  "upstream_ref": "sgl-project/sglang:release/v0.5.22",
+  "upstream_commit": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+  "original_feature_head": "ed565e76dd4aed44ab3f4141fae3450dba3b0bc2",
+  "original_runtime": "v0.5.18 plus supplied 29 patches and delivered 0042/0043/0044",
+  "scope": "Only existing implemented functionality; roadmap proposals excluded.",
+  "patches": [
+    {
+      "patch": "0003-3410a9a1.patch",
+      "sha256": "1eda33d9573a5396c7c03051115c940eb3a804dc7dca75eaf9a037beeda98476",
+      "owner": "root",
+      "status": "migrated",
+      "feature": "Opt-in PD decode cache report and default streaming usage",
+      "adaptation": "environ.py and pd_disaggregation_hook.py; default false.",
+      "original_runtime_files": [
+        "python/sglang/srt/arg_groups/pd_disaggregation_hook.py",
+        "python/sglang/srt/environ.py"
+      ]
+    },
+    {
+      "patch": "0004-44f893e8.patch",
+      "sha256": "f47a221b12d8f72a7980566200c89e4a7b4aceb99d89bc676df333323c50f149",
+      "owner": "root",
+      "status": "migrated",
+      "feature": "Trim speculative reasoning usage to emitted tokens",
+      "adaptation": "Finish-state update precedes speculative reasoning count and counts emitted tokens only; release test accepts 6 draft tokens but emits 2 and reports reasoning=2.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/schedule_batch.py",
+        "python/sglang/srt/managers/scheduler_components/batch_result_processor.py"
+      ]
+    },
+    {
+      "patch": "0005-e80328ed.patch",
+      "sha256": "29f6b780fae7a13e813e50f26950239069992823b7deb31c6c139007783b6f7d",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Tolerate unescaped control characters in history tool arguments",
+      "adaptation": "orjson fast path, json.loads(strict=False) fallback; object shape validation retained.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/openai/serving_chat.py"
+      ]
+    },
+    {
+      "patch": "0006-193c1b42.patch",
+      "sha256": "e5d014a208d8010dc6d9cd9893ad324edab37f6b82c07f9328ed4e52f2622f55",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Strip leading UTF-8 BOM from JSON requests",
+      "adaptation": "Split ASGI chunks supported; non-JSON and non-leading BOM preserved.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/utils/utf8_bom_middleware.py"
+      ]
+    },
+    {
+      "patch": "0007-a7b6af5e.patch",
+      "sha256": "c2ddb849589da9881642054b65418fa86c0cfd5c807c1634645afb5022dcfcb5",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Preserve HTTP status for abort before first SSE chunk",
+      "adaptation": "Chat and Completions first-result prefetch raises typed abort; after-stream errors remain SSE.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/openai/serving_base.py",
+        "python/sglang/srt/entrypoints/openai/serving_chat.py",
+        "python/sglang/srt/entrypoints/openai/serving_completions.py"
+      ]
+    },
+    {
+      "patch": "0008-989cb357.patch",
+      "sha256": "774882a7ebf62bb3112553be23c2318f77e2b19dfafa2ae8ca343b29c4449c22",
+      "owner": "upstream",
+      "status": "upstream_covered",
+      "feature": "Report cached_tokens=0 when cache report enabled",
+      "adaptation": "UsageProcessor.calculate_response_usage and calculate_streaming_usage instantiate PromptTokensDetails without positive-count gate.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/openai/usage_processor.py"
+      ]
+    },
+    {
+      "patch": "0009-b9da69fb.patch",
+      "sha256": "4a141d943571cd042997e86dc8ea5e6b9448a0185a4d8d4b9fd85cf4346d3edb",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Chat builtin web_search compatibility",
+      "adaptation": "BuiltinWebSearchTool protocol, wrapper filtering, native browser adapter and Chat route delegation. Native Kimi request encoding filters builtin tools while retaining ordinary function fields.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/entrypoints/openai/protocol.py",
+        "python/sglang/srt/entrypoints/openai/serving_chat.py",
+        "python/sglang/srt/entrypoints/openai/serving_responses.py",
+        "python/sglang/srt/entrypoints/tool.py"
+      ]
+    },
+    {
+      "patch": "0010-c48e20a2.patch",
+      "sha256": "12bf321664d47b81ef94f73b8c4ccfb6de624a1bfb7203ee68cdfca076f4ae04",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Keep Chat IDs, errors and tool choice for builtin web search",
+      "adaptation": "Use actual OpenAIServingChat instance; release Responses constructor remains backwards compatible through optional lazy handler.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/entrypoints/openai/serving_responses.py"
+      ]
+    },
+    {
+      "patch": "0011-0a1deaea.patch",
+      "sha256": "6617f7b27f12f1ff1a1dcbe7a062261229b9aef67ee79af7c20a785dd95bcb89",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Mooncake PD bootstrap stage diagnostics",
+      "adaptation": "Manual adaptation to release DP-rank query prefetch, combined admission budget and _send_kv_metadata; preserves extended wire format.",
+      "original_runtime_files": [
+        "python/sglang/srt/disaggregation/decode.py",
+        "python/sglang/srt/disaggregation/mooncake/conn.py"
+      ]
+    },
+    {
+      "patch": "0012-42b19337.patch",
+      "sha256": "f09221d3992a93733a67d7c5e78717806d29d01da4c28568670feae3284f8e67",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Blacklist sessions after consecutive KV transfer failures",
+      "adaptation": "Default threshold 2, success resets sequence, state-send failure behavior and deferred abort poisoning preserved.",
+      "original_runtime_files": [
+        "python/sglang/srt/disaggregation/mooncake/conn.py",
+        "python/sglang/srt/environ.py"
+      ]
+    },
+    {
+      "patch": "0013-86bcbcc3.patch",
+      "sha256": "c644f6e987e8b2db8554f264efc829381b962ccc331ca428b79e1787c23f2a80",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Mooncake background-thread liveness and progress metrics",
+      "adaptation": "Monitor wrappers retain returned threads and upstream role-switch _worker_threads stop/join lifecycle; Common heartbeat hook returns thread.",
+      "original_runtime_files": [
+        "python/sglang/srt/disaggregation/common/conn.py",
+        "python/sglang/srt/disaggregation/mooncake/conn.py"
+      ]
+    },
+    {
+      "patch": "0014-f7f331f9.patch",
+      "sha256": "01ef4f4466477d334b94d59ea910c75ba4d0c9459f3dc0c00bd4524780af6972",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Local bootstrap metadata reference during cleanup",
+      "adaptation": "TransferInfo parsing keeps room_transfer_infos local after global entry removal; regression injects deletion during replica resolution.",
+      "original_runtime_files": [
+        "python/sglang/srt/disaggregation/mooncake/conn.py"
+      ]
+    },
+    {
+      "patch": "0015-e3619b51.patch",
+      "sha256": "ee09c41a315cec2b381bc79f15b77900430a77038e2b8ace7d737c10dcee74cf",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Keep device prefix contiguous across host-only ancestors",
+      "adaptation": "Ported the device-prefix contiguity guard to the release Python UnifiedTreeCore; resident descendants beyond a host-only gap never extend the device prefix, including split matches. Old HiRadixCache is not recreated. The deployment profile must explicitly set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python; the upstream Rust default/extension is unchanged.",
+      "original_runtime_files": [
+        "python/sglang/srt/mem_cache/hiradix_cache.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0016-7acdacca.patch",
+      "sha256": "77de7af98d6cd0232e80973f8189da81be4f0c154e6980e4f3cbb25c756644de",
+      "owner": "root",
+      "status": "migrated",
+      "feature": "Scheduler subprocess liveness metrics",
+      "adaptation": "Adapted to release parent-prelaunch process ownership and controller exclusion.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/engine.py",
+        "python/sglang/srt/managers/data_parallel_controller.py",
+        "python/sglang/srt/utils/watchdog.py"
+      ]
+    },
+    {
+      "patch": "0017-f720595d.patch",
+      "sha256": "7c83d98f39d9ba2f96fccf40b46f365554ddfc9dbec73e8cf94e509eaa2a40b5",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "FPM decode metrics fallback when seq_lens_cpu absent",
+      "adaptation": "The release _decode_total_seq_lens helper already handles None, but the actual _build_scheduled_request_metrics builder did not. Its decode path now falls back to request.seqlen, with a direct regression.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/scheduler_components/metrics_reporter.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0019-394485aa.patch",
+      "sha256": "e6355ce2b3bd5ba14cde60b04f793200b81d5bf4fcc2da13c05ce1cdc2a12a52",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Map known context-length errors to HTTP 413",
+      "adaptation": "Preserved error message matching and streaming error code behavior.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/openai/serving_base.py"
+      ]
+    },
+    {
+      "patch": "0021-81656471.patch",
+      "sha256": "e6a9bcadf7c21be0635c27f9c1d6ae7988743ad0d52395ea6f0ce1577e082337",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Exact prefetch capacity and FIFO retry",
+      "adaptation": "Default-off exact requested-plus-occupied capacity gate and strict FIFO migrated onto CacheRequestHandle-owned pending state. Oversize requests recompute instead of remaining pending; abort/reset/detach release waiters. Capacity retries do not consume the release storage re-query attempt budget, and prefetch_from_storage retains the release Optional[bool] PP-ticket return contract. Buffer-only mode retains official pool-backed allocation/FIFO behavior.",
+      "original_runtime_files": [
+        "python/sglang/srt/environ.py",
+        "python/sglang/srt/managers/cache_controller.py",
+        "python/sglang/srt/managers/schedule_batch.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/mem_cache/hiradix_cache.py",
+        "python/sglang/srt/mem_cache/unified_radix_cache.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0024-a18b66f5.patch",
+      "sha256": "51d7d1c45e1c7421f094f9ffe62e9e1d4987dbcc43b0d5ee21b226db7029f976",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Hierarchical cache request/operation/transfer metrics",
+      "adaptation": "Request/operation/transfer observations, sampled normal summaries, rate-limited anomaly summaries and slow backup snapshots are attached to the release lifecycle. Admission observations describe committed admission, terminal observations are one-shot, and ACK-owned host/sidecar release remains with the official release owner. Cost/deadline sticky wait state survives zero-use metric discard until actual admission/abort.",
+      "original_runtime_files": [
+        "python/sglang/srt/environ.py",
+        "python/sglang/srt/managers/cache_controller.py",
+        "python/sglang/srt/managers/schedule_batch.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/scheduler_components/output_streamer.py",
+        "python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py",
+        "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py",
+        "python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py",
+        "python/sglang/srt/mem_cache/unified_radix_cache.py",
+        "python/sglang/srt/observability/cache_metrics.py",
+        "python/sglang/srt/observability/cache_observation.py",
+        "python/sglang/srt/observability/metrics_collector.py",
+        "python/sglang/srt/observability/storage_io.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0025-0fe5a860.patch",
+      "sha256": "8f24dd4a58297922bdb5f29880c04e3b394d4fb8e200252fa67a395dc10420d5",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Mooncake SDK batch object/byte/duration metrics",
+      "adaptation": "Mooncake lowest-level SDK wrappers preserve scalar/multi-buffer signatures, replication group config, result identity and exceptions. Count all calls, objects, durations and SDK-success bytes; these are not measured wire bytes. Independent review found no duplicate SDK accounting or ownership changes.",
+      "original_runtime_files": [
+        "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py",
+        "python/sglang/srt/mem_cache/unified_radix_cache.py",
+        "python/sglang/srt/observability/cache_metrics.py",
+        "python/sglang/srt/observability/storage_io.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0027-06dd5400.patch",
+      "sha256": "f09b61d19961488778768db21f5b624c3fe8bb1dbc15cfaa045805d3f444b896",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Cache prefix drift and host mutation attribution",
+      "adaptation": "Enqueue/admission/use drift and bounded node mutation history migrated to Python UnifiedTreeCore, including host allocation caller/free/budget/trigger attribution. History is bounded and reset-aware; failed admission does not overwrite a committed match. Full node attribution requires the explicit Python TreeCore deployment profile.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py",
+        "python/sglang/srt/mem_cache/unified_radix_cache.py",
+        "python/sglang/srt/observability/cache_observation.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0028-da89535c.patch",
+      "sha256": "1312c4a193b746f163532a66b4cd35d1e1f1fc74b05e4da9e29178c358018934",
+      "owner": "package_design",
+      "status": "upstream_mechanism_plus_migrated_observability",
+      "feature": "Bounded L3 recheck after local device prefix loss",
+      "adaptation": "Retain release _prefetch_after_device_hit_loss and StoragePrefetchRetries/max_attempts, without adding duplicate old retry machinery; restore record_l3_admission_recheck on the actual bounded retry path.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/schedule_batch.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/observability/cache_observation.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0029-af8d0fb9.patch",
+      "sha256": "1706799d6f6ac1cc641f7d6a803a8b149ed2849ec1cfebfd77062aaa9ee19090",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Throttled Prefill no-batch and FIFO diagnostics",
+      "adaptation": "Read-only rank-zero Prefill no-batch/FIFO snapshot after a sustained 2-second stall, with a 10-second log interval; capacity-event and node-history storage are bounded.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/cache_controller.py",
+        "python/sglang/srt/managers/schedule_batch.py",
+        "python/sglang/srt/managers/scheduler.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0030-127efec8.patch",
+      "sha256": "45ff1540fe92a1735d95f37ac562be688a5c166b3aa492ba0b2f6e3aba53f051",
+      "owner": "package_design",
+      "status": "migrated",
+      "feature": "Retry pending FIFO head in Bootstrap queue",
+      "adaptation": "Retry only the oldest capacity waiter while it is still in the bootstrap queue, after official HiCache event processing. Preserve bootstrap order and official request-handle/ticket semantics; feature-off is a no-op.",
+      "original_runtime_files": [
+        "python/sglang/srt/disaggregation/prefill.py",
+        "python/sglang/srt/observability/cache_observation.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0033-f20b0d30.patch",
+      "sha256": "d7b805dccea756c0ffbeb1cdcf6165b91df9a9dbfabf8e50f2ff3395dcc225d3",
+      "owner": "upstream",
+      "status": "upstream_covered",
+      "feature": "Stable Chat streaming created timestamp",
+      "adaptation": "Release captures created once per _generate_chat_stream and passes to text/reasoning/tool/tail/usage paths.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/openai/serving_chat.py"
+      ]
+    },
+    {
+      "patch": "0034-68e7b3cf.patch",
+      "sha256": "19fe58cf5ab3ae0247c5c2e97752621b3ff69b3f2528bb8936fbccfda09c8629",
+      "owner": "legacy_audit",
+      "status": "migrated",
+      "feature": "Tool stream metadata only on initial delta",
+      "adaptation": "Only tool deltas use exclude_unset; ordinary Chat/nonstreaming defaults retained; explicit chunk object/created retained.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/openai/serving_chat.py"
+      ]
+    },
+    {
+      "patch": "0035-ecb07b92.patch",
+      "sha256": "df353935858796f3ccbc893f12b6b1ac49d5ffc4323bfc1011eeb41add177a2c",
+      "owner": "upstream",
+      "status": "upstream_covered",
+      "feature": "Account for PD handoff reasoning token without replay duplication",
+      "adaptation": "DecodeTransferQueue already calls _maybe_update_reasoning_tokens only when not replayed_boundary.",
+      "original_runtime_files": [
+        "python/sglang/srt/disaggregation/decode.py"
+      ]
+    },
+    {
+      "patch": "0036-4dc4dfe5.patch",
+      "sha256": "fc0aaa4cb1d0907fb9e88b5c1c8066af4475e7a0e6647162e70b180ea9fd3b06",
+      "owner": "root",
+      "status": "migrated",
+      "feature": "Protect speculative context execution window",
+      "adaptation": "Retain release allocator max_new_tokens_for_memory clipping while reserving one or two speculative windows.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/utils.py"
+      ]
+    },
+    {
+      "patch": "0040-glm53-opt-backport.patch",
+      "sha256": "7d62ea7ba9b81af97c7ca40d4e6145b3183da2eef983f7ca661e4b77f6f454be",
+      "owner": "root + package_design",
+      "status": "subsumed_by_feature_commits",
+      "feature": "DP admission, L3 cost aware and Prefill time budget",
+      "adaptation": "Migrate original feature implementation onto release APIs; do not apply old v0.5.18 combined backport verbatim.",
+      "original_runtime_files": [
+        "python/sglang/srt/entrypoints/http_server.py",
+        "python/sglang/srt/managers/data_parallel_controller.py",
+        "python/sglang/srt/managers/dp_admission.py",
+        "python/sglang/srt/managers/io_struct.py",
+        "python/sglang/srt/managers/load_snapshot.py",
+        "python/sglang/srt/managers/schedule_policy.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/scheduler_components/load_inquirer.py",
+        "python/sglang/srt/managers/scheduler_components/prefill_time_budget.py",
+        "python/sglang/srt/managers/tokenizer_manager.py",
+        "python/sglang/srt/mem_cache/prefetch_cost.py",
+        "python/sglang/srt/mem_cache/unified_radix_cache.py",
+        "python/sglang/srt/server_args.py"
+      ],
+      "cache_prefill_adaptation": "L3 cost-aware and Prefill time-budget portions retain release ownership, memory-budget and PP-ticket APIs; cache migration regressions pass. DP portion remains accounted by root."
+    },
+    {
+      "patch": "0041-dp-admission-kvfix.patch",
+      "sha256": "7dc77cc4e3ab718ea48a73defdd972a3edbb3f7c5d9ccc512348778c177bccb7",
+      "owner": "root",
+      "status": "subsumed_by_release_kv_ownership_adaptation",
+      "feature": "v0.5.18 Req.kv compatibility fix",
+      "adaptation": "0.5.22 has typed ownership; preserve full KV/Mamba/backup ownership checks in migrated admission rather than old None-only compatibility path.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/dp_admission.py"
+      ]
+    },
+    {
+      "patch": "0042-dp-release-feedback.patch",
+      "sha256": "af6d4b4cbea6d9b52149ce1ceaf2e74753079695c1dba3e236cc2a1fa21c8c85",
+      "owner": "root",
+      "status": "subsumed_by_feature_commits",
+      "feature": "Publish admission capacity after physical release",
+      "adaptation": "Equivalent feature commit 67dddaff migrated; test release result/free-group ordering.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/dp_admission.py",
+        "python/sglang/srt/managers/load_snapshot.py",
+        "python/sglang/srt/managers/scheduler.py",
+        "python/sglang/srt/managers/scheduler_components/load_inquirer.py"
+      ]
+    },
+    {
+      "patch": "0043-prefill-time-diagnostics.patch",
+      "sha256": "233093140e1731335d4f28dd1dafc3f10c5cb2598900481fb7ceface56af7e8c",
+      "owner": "package_design",
+      "status": "subsumed_by_feature_commits",
+      "feature": "Committed Prefill time-budget diagnostics",
+      "adaptation": "Migrate the existing Prefill time budget/model and committed diagnostics onto release PrefillAdder memory-budget and chunk alignment APIs. Removed unrelated newer-upstream Mamba-grid/replay dependencies from the three-way conflict; release accounting remains intact.",
+      "original_runtime_files": [
+        "python/sglang/srt/managers/schedule_policy.py",
+        "python/sglang/srt/managers/scheduler_components/metrics_reporter.py",
+        "python/sglang/srt/managers/scheduler_components/prefill_time_budget.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    },
+    {
+      "patch": "0044-l3-cost-diagnostics.patch",
+      "sha256": "3552132fb7200350ac90d08a14a322f143a201162edf7d5fdac702e5e714f753",
+      "owner": "package_design",
+      "status": "subsumed_by_feature_commits",
+      "feature": "L3 lifecycle and terminal cost-decision diagnostics",
+      "adaptation": "Migrate existing L3 terminal cost diagnostics and sticky timeout/cost wait behavior onto release stage/insert/ACK ownership. A single first rank-agreed stop owns the outcome counter; legacy request/operation/SDK observation does not duplicate it. Two-rank Gloo deadline and cost agreement regressions pass.",
+      "original_runtime_files": [
+        "python/sglang/srt/mem_cache/prefetch_cost.py",
+        "python/sglang/srt/mem_cache/unified_radix_cache.py"
+      ],
+      "validation": "cache_prefill_release_v0522_cpu"
+    }
+  ],
+  "validation": {
+    "legacy_api_and_mooncake": {
+      "result": "333 tests and 210 subtests passed",
+      "log": "/tmp/v0522-legacy-regressions-final.log",
+      "scope": "Original Chat/Completion/Responses/protocol/usage suites plus new legacy API/BOM/Mooncake contracts and release batching/deferred-KV tests."
+    },
+    "final_native_tools_followup": {
+      "result": "16 tests and 14 subtests passed; 150 deselected",
+      "log": "/tmp/v0522-legacy-native-tools.log",
+      "scope": "One additional native-Kimi builtin filtering regression plus existing Kimi and legacy API contracts; the final total API/Mooncake collection contains 334 tests."
+    },
+    "static": "All migrated API/Mooncake source/test files pass configured Ruff, format, isort and compilation checks; migration reject/backup files removed.",
+    "parent_dp_admission": "Final integration: 147 tests and 704 subtests passed, including real controller construction, HTTP/IPC, ownership and actual process liveness.",
+    "cache_integration": "Complete: 292 tests and 287 subtests passed, 2 CUDA-only tests skipped; includes real local two-rank Gloo lifecycle agreement.",
+    "scope_limit": "CPU contracts and mocked transport tests only; no GPU execution, Mooncake cluster load test or throughput validation performed by this audit.",
+    "deployment_profile": "Generated workers and startup preflight explicitly require SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python so Python tree fixes execute; upstream global default remains unchanged."
+  },
+  "upstream_evidence": {
+    "0008": "python/sglang/srt/entrypoints/openai/usage_processor.py: UsageProcessor.calculate_response_usage and calculate_streaming_usage construct PromptTokensDetails even when cached_tokens is zero.",
+    "0033": "python/sglang/srt/entrypoints/openai/serving_chat.py: _generate_chat_stream captures created once and propagates it across text, reasoning, tool, usage and final events.",
+    "0035": "python/sglang/srt/disaggregation/decode.py: DecodeTransferQueue handoff runs _maybe_update_reasoning_tokens only if not replayed_boundary.",
+    "0028": "python/sglang/srt/managers/scheduler.py: _prefetch_after_device_hit_loss; python/sglang/srt/mem_cache/storage_prefetch.py: StoragePrefetchRetries max_attempts mechanism."
+  },
+  "validations": {
+    "cache_prefill_release_v0522_cpu": {
+      "passed": 292,
+      "subtests_passed": 287,
+      "skipped": 2,
+      "skips": "CUDA-required transfer stream ordering and direct backend device translation tests; no GPU hardware available.",
+      "environment": {
+        "python": "/tmp/sglang-next-venv/bin/python",
+        "PYTHONPATH": "python",
+        "SGLANG_CACHE_DIR": "/tmp/v0522-sglang-cache",
+        "TORCHINDUCTOR_CACHE_DIR": "/tmp/v0522-inductor-cache",
+        "GLOO_SOCKET_IFNAME": "lo"
+      },
+      "suites": [
+        {
+          "passed": 265,
+          "subtests_passed": 271,
+          "skipped": 2,
+          "seconds": 26.48,
+          "log": "/tmp/v0522-cache-final-regression2.log",
+          "files": [
+            "test/registered/unit/managers/scheduler_components/test_prefill_time_budget.py",
+            "test/registered/unit/managers/test_prefill_adder.py",
+            "test/registered/unit/managers/test_deterministic_chunk_align.py",
+            "test/registered/unit/mem_cache/test_prefetch_cost.py",
+            "test/registered/unit/mem_cache/test_storage_prefetch_metrics.py",
+            "test/registered/unit/mem_cache/test_glm53_cache_migration.py",
+            "test/registered/unit/mem_cache/test_unified_hicache_regressions.py",
+            "test/registered/unit/mem_cache/test_unified_hicache_transfer_lifecycle.py",
+            "test/registered/unit/mem_cache/test_hicache_pp_sync_drain.py",
+            "test/registered/unit/mem_cache/test_mooncake_store_config.py",
+            "test/registered/unit/mem_cache/test_mooncake_group_semantics.py",
+            "test/registered/unit/mem_cache/test_mooncake_tenant_config.py",
+            "test/registered/unit/observability/test_forward_pass_metrics.py",
+            "test/registered/unit/managers/test_output_streamer_logprobs.py",
+            "test/registered/unit/managers/test_output_streamer_customized_info.py",
+            "test/registered/unit/server_args/test_prefill_time_budget_args.py",
+            "test/registered/unit/server_args/test_hicache_prefetch_cost_args.py",
+            "test/registered/unit/disaggregation/test_prefill_result_polling.py",
+            "test/registered/unit/disaggregation/test_prefill_abort_result_cleanup.py"
+          ]
+        },
+        {
+          "passed": 27,
+          "subtests_passed": 16,
+          "skipped": 0,
+          "seconds": 40.04,
+          "log": "/tmp/v0522-cache-lifecycle-gloo.log",
+          "files": [
+            "test/registered/unit/mem_cache/test_storage_prefetch_lifecycle.py"
+          ],
+          "includes": "Local two-rank Gloo agreement on deadline expiry and cost-aware stop; release cancellation/staging/ACK ownership."
+        }
+      ],
+      "deployment_requirement": "The full migrated Python cache behavior requires SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python in the generated P/D profile. The upstream global default and native Rust TreeCore binary remain unchanged.",
+      "limitations": "CPU tests verify logic, ordering and ownership; no new GPU throughput, latency or GLM numerical-accuracy claims."
+    }
+  }
+}

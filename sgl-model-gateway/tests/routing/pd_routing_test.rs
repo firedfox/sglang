@@ -683,6 +683,187 @@ mod pd_responses_routing_tests {
         }
     }
 
+    /// Decode admission must fail promptly even when prefill is waiting for
+    /// bootstrap. The TCP peer, rather than a detached HTTP handler, proves
+    /// the pending prefill connection is closed before the router returns.
+    async fn assert_decode_rejection_cancels_prefill(
+        status: Option<StatusCode>,
+        stream: bool,
+        cancel_error_body: bool,
+    ) {
+        let prefill_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let decode_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let prefill_url = format!("http://{}", prefill_listener.local_addr().unwrap());
+        let decode_url = format!("http://{}", decode_listener.local_addr().unwrap());
+        let (prefill_started_tx, prefill_started_rx) = oneshot::channel();
+        let (prefill_closed_tx, prefill_closed_rx) = oneshot::channel();
+        let (body_waiting_tx, body_waiting_rx) = oneshot::channel();
+        let mut prefill_task = tokio::spawn(async move {
+            let (socket, _) = prefill_listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let body = read_responses_post(&mut socket).await;
+            prefill_started_tx.send(()).unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+            let _ = prefill_closed_tx.send(());
+            body
+        });
+        let mut decode_task = tokio::spawn(async move {
+            let (socket, _) = decode_listener.accept().await.unwrap();
+            let mut socket = BufReader::new(socket);
+            let body = read_responses_post(&mut socket).await;
+            prefill_started_rx.await.unwrap();
+            if let Some(status) = status {
+                let error_body = r#"{"error":{"message":"Decode capacity exhausted"}}"#;
+                let response = format!(
+                    "HTTP/1.1 {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 2\r\nConnection: close\r\n\r\n",
+                    status, error_body.len()
+                );
+                socket
+                    .get_mut()
+                    .write_all(response.as_bytes())
+                    .await
+                    .unwrap();
+                // Only headers are available until P disconnects. Reading D's
+                // body before dropping P would deadlock this test.
+                prefill_closed_rx.await.unwrap();
+                if cancel_error_body {
+                    body_waiting_tx.send(()).unwrap();
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+                } else {
+                    socket
+                        .get_mut()
+                        .write_all(error_body.as_bytes())
+                        .await
+                        .unwrap();
+                }
+            }
+            // None closes the connection before headers: a transport failure.
+            body
+        });
+
+        let mut router = make_pd_router();
+        router.retry_config.max_retries = 1;
+        let prefill = Arc::new(
+            BasicWorkerBuilder::new(prefill_url)
+                .worker_type(CoreWorkerType::Prefill {
+                    bootstrap_port: Some(9001),
+                })
+                .build(),
+        );
+        let decode = Arc::new(
+            BasicWorkerBuilder::new(decode_url)
+                .worker_type(CoreWorkerType::Decode)
+                .build(),
+        );
+        prefill.set_healthy(true);
+        decode.set_healthy(true);
+        router.worker_registry.register(prefill.clone());
+        router.worker_registry.register(decode.clone());
+        let request = responses_request(json!({
+            "model": "mock-model", "input": "Long prompt", "stream": stream
+        }));
+
+        let result = timeout(Duration::from_secs(5), async {
+            let (response_status, retry_after, body) = if cancel_error_body {
+                let mut dispatch = Box::pin(router.route_responses(None, &request, None));
+                tokio::select! {
+                    _ = &mut dispatch => panic!("error body must still be pending"),
+                    result = body_waiting_rx => result.unwrap(),
+                }
+                assert_eq!(decode.circuit_breaker().total_failures(), 1);
+                assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+                // Client cancellation must close D and must not erase or
+                // double-count the failure already known from its headers.
+                drop(dispatch);
+                (None, None, bytes::Bytes::new())
+            } else {
+                let response = router.route_responses(None, &request, None).await;
+                let status = response.status();
+                let retry_after = response.headers().get("retry-after").cloned();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                (Some(status), retry_after, body)
+            };
+            let (prefill_body, decode_body) = tokio::join!(&mut prefill_task, &mut decode_task);
+            (
+                response_status,
+                retry_after,
+                body,
+                prefill_body.unwrap(),
+                decode_body.unwrap(),
+            )
+        })
+        .await;
+        if result.is_err() {
+            for task in [&mut prefill_task, &mut decode_task] {
+                if !task.is_finished() {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        }
+        let (actual, retry_after, body, prefill_body, decode_body) = result
+            .expect("decode rejection must cancel prefill without waiting for bootstrap timeout");
+        assert_eq!(
+            actual,
+            (!cancel_error_body).then_some(status.unwrap_or(StatusCode::BAD_GATEWAY))
+        );
+        if status.is_some() && !cancel_error_body {
+            assert_eq!(retry_after.unwrap(), "2");
+            assert!(String::from_utf8_lossy(&body).contains("Decode capacity exhausted"));
+        }
+        assert_eq!(
+            prefill_body["bootstrap_room"],
+            decode_body["bootstrap_room"]
+        );
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.circuit_breaker().total_failures(), 0);
+        assert_eq!(prefill.circuit_breaker().total_successes(), 0);
+        let decode_failed = status.is_none_or(|status| status.is_server_error());
+        assert_eq!(
+            decode.circuit_breaker().total_failures(),
+            u64::from(decode_failed)
+        );
+        assert_eq!(
+            decode.circuit_breaker().total_successes(),
+            u64::from(!decode_failed)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_decode_admission_rejection_cancels_pending_prefill() {
+        for status in [
+            StatusCode::BAD_REQUEST,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for stream in [false, true] {
+                assert_decode_rejection_cancels_prefill(Some(status), stream, false).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_transport_failure_cancels_pending_prefill() {
+        for stream in [false, true] {
+            assert_decode_rejection_cancels_prefill(None, stream, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_decode_failure_is_recorded_before_error_body_and_client_cancellation() {
+        for stream in [false, true] {
+            assert_decode_rejection_cancels_prefill(
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                stream,
+                true,
+            )
+            .await;
+        }
+    }
+
     /// Detached background responses (`background=true, stream=false`) are
     /// retrieved through the /v1/responses/{id} endpoints, which the PD router
     /// does not implement. They must be rejected deterministically instead of

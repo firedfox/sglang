@@ -8,13 +8,31 @@ import threading
 import time
 from contextlib import contextmanager
 from multiprocessing import Process
-from typing import Callable, List, Optional
+from typing import Callable, Dict, List, Optional, Set
 
 import psutil
 
 from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
 
 logger = logging.getLogger(__name__)
+
+_scheduler_process_up_gauge = None
+_scheduler_process_up_gauge_lock = threading.Lock()
+
+
+def _get_scheduler_process_up_gauge():
+    global _scheduler_process_up_gauge
+    with _scheduler_process_up_gauge_lock:
+        if _scheduler_process_up_gauge is None:
+            from prometheus_client import Gauge
+
+            _scheduler_process_up_gauge = Gauge(
+                name="sglang:scheduler_process_up",
+                documentation="Whether the scheduler process is alive (1) or not (0).",
+                labelnames=["model_name", "engine_type", "process_name"],
+                multiprocess_mode="mostrecent",
+            )
+    return _scheduler_process_up_gauge
 
 
 class Watchdog:
@@ -179,16 +197,36 @@ class SubprocessWatchdog:
         processes: List[Process],
         process_names: Optional[List[str]] = None,
         interval: float = 1.0,
+        metrics_labels: Optional[Dict[str, str]] = None,
+        metrics_process_names: Optional[Set[str]] = None,
     ):
         self._processes = processes
         self._names = process_names or [f"process_{i}" for i in range(len(processes))]
         self._interval = interval
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        self._metrics_labels = metrics_labels
+        self._metrics_process_names = metrics_process_names
+        self._process_up_gauge = (
+            _get_scheduler_process_up_gauge() if metrics_labels is not None else None
+        )
+
+    def _set_process_up(self, proc: Process, name: str) -> None:
+        if self._process_up_gauge is None or (
+            self._metrics_process_names is not None
+            and name not in self._metrics_process_names
+        ):
+            return
+        labels = dict(self._metrics_labels or {})
+        self._process_up_gauge.labels(**labels, process_name=name).set(
+            1 if proc.is_alive() else 0
+        )
 
     def start(self) -> None:
         if self._thread is not None or not self._processes:
             return
+        for proc, name in zip(self._processes, self._names):
+            self._set_process_up(proc, name)
         self._thread = threading.Thread(
             target=self._monitor_loop, daemon=True, name="subprocess-watchdog"
         )
@@ -210,6 +248,7 @@ class SubprocessWatchdog:
 
     def _check_processes(self) -> bool:
         for proc, name in zip(self._processes, self._names):
+            self._set_process_up(proc, name)
             if proc.is_alive() or proc.exitcode == 0:
                 continue
 

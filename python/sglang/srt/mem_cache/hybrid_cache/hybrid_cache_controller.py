@@ -19,10 +19,7 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     HiCacheController as BaseHiCacheController,
 )
-from sglang.srt.managers.cache_controller import (
-    LayerDoneCounter,
-    PrefetchAck,
-)
+from sglang.srt.managers.cache_controller import LayerDoneCounter, PrefetchAck
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
@@ -184,6 +181,7 @@ class PrefetchOperation(StorageOperation):
         # query. Trailing sidecars still use the untrimmed hit endpoint.
         self.sidecar_hash_values: Optional[list[str]] = None
         self.sidecar_hit_pages = 0
+        self.deadline_expired = False
 
     def mark_terminate(self):
         with self._lock:
@@ -739,13 +737,15 @@ class HybridCacheController(BaseHiCacheController):
         ]
         return domain.can_fit_many_then(domain_requests, (), empty=empty)
 
-    def prefetch_rate_limited(self) -> bool:
+    def prefetch_rate_limited(
+        self, requested_tokens: int = 0, request_id: Optional[str] = None
+    ) -> bool:
         if self.host_memory_mode == "buffer_only" and uses_shared_host_layout(
             self.mem_pool_host.anchor_entry.host_pool
         ):
             # Shared-arena occupancy includes the Full and SWA byte footprint.
             return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
-        return super().prefetch_rate_limited()
+        return super().prefetch_rate_limited(requested_tokens, request_id)
 
     def alloc_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
@@ -1646,8 +1646,14 @@ class HybridCacheController(BaseHiCacheController):
                 operation = self.backup_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
-                self._page_backup_or_log(operation)
+                self.active_backup_operation = operation
+                operation.cache_observation.mark("get_start")
+                try:
+                    self._page_backup_or_log(operation)
+                finally:
+                    operation.cache_observation.mark("get_done")
                 self.ack_backup_queue.put(operation)
+                self.active_backup_operation = None
             except Empty:
                 continue
 

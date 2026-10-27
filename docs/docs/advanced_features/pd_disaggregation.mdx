@@ -74,6 +74,83 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Decode DP admission
+
+Enable `--enable-dp-admission` on Decode to reserve a request slot and its full
+generation KV budget on a specific attention DP rank before dispatch. The feature
+is disabled by default. It complements the Gateway's HTTP concurrency limit:
+requests of different lengths consume different KV budgets, and an HTTP
+disconnect does not prove that the engine has released their KV memory.
+
+The initial implementation supports the Python HTTP server on a single Decode
+node with attention DP, `--load-balance-method total_tokens`, disabled decode
+radix caching, and Mooncake early allocation. PP, DCP, and attention CP sizes must
+be one on Decode. Text generation with one full-attention KV capacity is supported;
+SWA/SSM, KV sharding, multimodal inputs, embedding inputs, sessions, beam search,
+LoRA, elastic topology, role switching, and decode KV offload are excluded.
+When you enable speculation, use fixed top-k-one EAGLE/EAGLE3/NEXTN settings. Unsupported
+startup combinations fail validation rather than silently disabling admission.
+Prefill may still use its existing CP layout.
+
+Add these options to an otherwise compatible Decode command:
+
+```bash
+--enable-dp-admission \
+--load-balance-method total_tokens \
+--disable-radix-cache \
+--dp-admission-max-queued-requests 0
+```
+
+Capacity comes from each scheduler's resolved request and KV limits. The token
+charge is the page-aligned maximum of two requirements: prompt plus the full
+effective output budget and decode allocation reserve; or the page-aligned
+prompt plus the existing PD preallocation reserve. Preserving this order also
+handles a preallocation reserve that is not a whole number of pages.
+The effective output budget respects the requested limit (or remaining context
+when none is supplied), the scheduler's per-request context remainder, and any
+positive `SGLANG_MAX_NEW_TOKENS_LIMIT`. Admission does not shorten that budget
+to fit the KV pool: a request that cannot fit receives 400. The allocation
+reserve includes the active speculative allocation policy rather than assuming
+that four draft tokens always require only four additional KV slots.
+
+Each dispatch has an internal sequence number. Scheduler snapshots acknowledge
+that sequence and report live commitments. The controller adds reservations
+that have not yet been acknowledged, so a newer load timestamp cannot erase
+in-flight requests. A completed or aborted request retains its commitment until
+its KV and retraction resources are actually released, including delayed
+Mooncake transfer cleanup. Health requests follow the same capacity limits.
+
+| Result | HTTP status |
+| --- | --- |
+| A request cannot fit any eligible rank in this Decode engine even when it is empty | 400 |
+| Eligible rank budgets are occupied, or the bounded admission queue is full or expires | 429 |
+| No eligible rank has a fresh, valid capacity snapshot, or dispatch fails | 503 |
+
+With the default queue size of zero, capacity pressure returns immediately.
+Set `--dp-admission-max-queued-requests` to a positive value for a bounded FIFO
+queue; `--dp-admission-queue-timeout` defaults to 1.0 second. The queue is local
+to the Decode controller. Cancellation removes a queued request, but cancellation
+of dispatched work never refunds its reservation before scheduler cleanup.
+`--dp-admission-snapshot-timeout` defaults to 30.0 seconds. If every eligible
+snapshot is missing or stale, the controller rejects admission until capacity
+becomes available again.
+
+Native `/generate`, OpenAI Chat Completions, and Completions propagate admission
+rejections before streaming headers. Streaming batches and `n > 1` streaming
+are rejected before dispatch because this version does not provide atomic
+batch admission. With the feature enabled, `POST /v1/responses` and Anthropic
+streaming return 400: those entrypoints can emit events before the admission
+decision. Their behavior is unchanged when the feature is disabled. Prefer
+single-prompt, `n=1` requests when validating this mode.
+
+Use a Gateway version that cancels pending Prefill when Decode rejects early
+and preserves Decode's 429 response. Otherwise Prefill may continue waiting for
+a transfer that the rejected Decode request will never establish. The GLM-5.3
+launcher in `examples/runtime/glm53_pd` includes this mode as an explicit Decode
+opt-in. Validate GPU startup, request cancellation, KV accounting, and mixed
+prompt lengths before enabling it in production; the reservation policy does
+not establish a throughput or latency improvement by itself.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

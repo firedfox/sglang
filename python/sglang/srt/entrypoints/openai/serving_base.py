@@ -24,6 +24,30 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class StreamingAbortBeforeFirstChunk(Exception):
+    """Raised inside a streaming generator when the request is aborted with an
+    explicit error ``status_code`` BEFORE any chunk has been emitted (e.g. an
+    admission-time rejection such as "The request queue is full.").
+
+    At that point the HTTP 200 status line has not been committed yet, so the
+    handler can catch this and return a real HTTP error response whose status
+    code matches the error body -- instead of streaming the error inside an SSE
+    body under a 200 status. Once streaming has started the 200 is already on
+    the wire and an in-band SSE error chunk is the only option, so this is NOT
+    raised in that case.
+
+    Deliberately not a subclass of ``ValueError``: ``ValueError`` is already
+    caught and mapped to a default 400, which would discard the real status
+    code carried here.
+    """
+
+    def __init__(self, message: str, err_type: str, status_code: int):
+        super().__init__(message)
+        self.message = message
+        self.err_type = err_type
+        self.status_code = status_code
+
+
 # Base class for specific endpoint handlers
 class OpenAIServingBase(ABC):
     """Abstract base class for OpenAI endpoint handlers"""
@@ -204,6 +228,11 @@ class OpenAIServingBase(ABC):
     ) -> ORJSONResponse:
         """Create an error response"""
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
+        if status_code != 200 and (
+            "exceeds the model's maximum context length" in message
+            or "is longer than the model's context length" in message
+        ):
+            status_code = 413
         error = ErrorResponse(
             object="error",
             message=message,
@@ -220,6 +249,11 @@ class OpenAIServingBase(ABC):
         status_code: int = 400,
     ) -> str:
         """Create a streaming error response"""
+        if status_code != 200 and (
+            "exceeds the model's maximum context length" in message
+            or "is longer than the model's context length" in message
+        ):
+            status_code = 413
         error = ErrorResponse(
             object="error",
             message=message,

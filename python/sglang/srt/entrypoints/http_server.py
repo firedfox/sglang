@@ -196,6 +196,7 @@ from sglang.srt.utils.json_response import (
     orjson_response,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+from sglang.srt.utils.utf8_bom_middleware import Utf8BomStripMiddleware
 from sglang.srt.utils.watchdog import SubprocessWatchdog
 from sglang.utils import get_exception_traceback
 from sglang.version import __version__
@@ -389,6 +390,7 @@ async def lifespan(fast_api_app: FastAPI):
             _global_state.template_manager,
             enable_prompt_tokens_details=True,
             tool_server=tool_server,
+            chat_serving=fast_api_app.state.openai_serving_chat,
         )
     except Exception as e:
         # Optional endpoint; a load failure (e.g. the gpt-oss harmony vocab
@@ -491,6 +493,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(Utf8BomStripMiddleware)
 
 if envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get():
     from sglang.srt.entrypoints.http_request_decompression import (
@@ -931,12 +934,12 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
     if envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get():
         apply_header_overrides(obj, request.headers)
     if obj.stream:
+        admission_enabled = get_parallel().enable_dp_admission
+        source = _global_state.tokenizer_manager.generate_request(obj, request)
 
         async def stream_results() -> AsyncIterator[bytes]:
             try:
-                async for out in _global_state.tokenizer_manager.generate_request(
-                    obj, request
-                ):
+                async for out in source:
                     yield b"data: " + dumps_json(out) + b"\n\n"
             except ValueError as e:
                 # A client disconnect also surfaces here. It's a client-side
@@ -956,10 +959,38 @@ async def serve_generate_request(obj: GenerateReqInput, request: Request):
                 }
                 logger.error(f"[http_server] Error: {e}")
                 yield b"data: " + dumps_json(out) + b"\n\n"
+            finally:
+                if admission_enabled:
+                    await source.aclose()
             yield b"data: [DONE]\n\n"
 
+        body = stream_results()
+        if admission_enabled:
+            # Admission errors must reach the router as HTTP 400/429/503 before
+            # StreamingResponse sends 200. The OpenAI handlers already prefetch
+            # their first chunk; the native PD /generate path needs the same
+            # ordering. Close both iterators when cancelled during or after it.
+            try:
+                first_chunk = await anext(body, None)
+            except BaseException:
+                await body.aclose()
+                raise
+
+            async def prepend_first_chunk() -> AsyncIterator[bytes]:
+                try:
+                    if first_chunk is not None:
+                        yield first_chunk
+                    async for chunk in body:
+                        yield chunk
+                finally:
+                    await body.aclose()
+
+            response_body = prepend_first_chunk()
+        else:
+            response_body = body
+
         return StreamingResponse(
-            stream_results(),
+            response_body,
             media_type="text/event-stream",
             background=_global_state.tokenizer_manager.create_abort_task(obj),
         )
@@ -1805,6 +1836,15 @@ async def openai_v1_chat_completions(
     request: ChatCompletionRequest, raw_request: Request
 ):
     """OpenAI-compatible chat completion endpoint."""
+    responses_serving = getattr(raw_request.app.state, "openai_serving_responses", None)
+    if responses_serving is not None and responses_serving.has_builtin_web_search_tools(
+        request
+    ):
+        return model_json_response(
+            await responses_serving.handle_chat_completions_compatible_request(
+                request, raw_request
+            )
+        )
     return model_json_response(
         await raw_request.app.state.openai_serving_chat.handle_request(
             request, raw_request
@@ -1999,6 +2039,16 @@ async def v1_decisions_request(request: DecisionRequest, raw_request: Request):
 @app.post("/v1/responses", dependencies=[Depends(validate_json_request)])
 async def v1_responses_request(request: ResponsesRequest, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
+    if get_parallel().enable_dp_admission:
+        # Responses emits lifecycle events before engine admission and may run
+        # several tool iterations. It cannot yet preserve admission HTTP status.
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=(
+                "DP admission does not support /v1/responses yet; use /generate, "
+                "/v1/chat/completions, or /v1/completions."
+            ),
+        )
 
     result = await raw_request.app.state.openai_serving_responses.create_responses(
         request, raw_request
@@ -2095,6 +2145,16 @@ async def anthropic_v1_messages(
     request: AnthropicMessagesRequest, raw_request: Request
 ):
     """Anthropic-compatible Messages API endpoint."""
+    if request.stream and get_parallel().enable_dp_admission:
+        # The Anthropic adapter sends headers before requesting a model chunk.
+        # Non-streaming messages already preserve the engine's HTTP status.
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail=(
+                "DP admission does not support streaming /v1/messages yet; "
+                "use stream=false or /v1/chat/completions."
+            ),
+        )
     return await raw_request.app.state.anthropic_serving.handle_messages(
         request, raw_request
     )

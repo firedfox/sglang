@@ -5,7 +5,7 @@ use axum::{
     body::Body,
     extract::Request,
     http::{
-        header::{CONTENT_LENGTH, CONTENT_TYPE},
+        header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE},
         HeaderMap, HeaderValue, StatusCode,
     },
     response::{IntoResponse, Response},
@@ -83,7 +83,10 @@ struct PDRequestContext<'a> {
 /// and skips its own status-based `record_outcome` calls so a decode-only
 /// transport failure can't be misattributed to a healthy prefill.
 #[derive(Clone, Copy)]
-struct BreakerOutcomesRecorded;
+enum BreakerOutcomesRecorded {
+    Prefill,
+    Decode,
+}
 
 impl PDRouter {
     fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
@@ -472,16 +475,21 @@ impl PDRouter {
                         // Record worker errors for server errors (5xx)
                         if status.is_server_error() {
                             let error_type = error_type_from_status(status);
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_PREFILL,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
-                            Metrics::record_worker_error(
-                                metrics_labels::WORKER_DECODE,
-                                metrics_labels::CONNECTION_HTTP,
-                                error_type,
-                            );
+                            let attributed = response.extensions().get::<BreakerOutcomesRecorded>();
+                            if !matches!(attributed, Some(BreakerOutcomesRecorded::Decode)) {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_PREFILL,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type,
+                                );
+                            }
+                            if !matches!(attributed, Some(BreakerOutcomesRecorded::Prefill)) {
+                                Metrics::record_worker_error(
+                                    metrics_labels::WORKER_DECODE,
+                                    metrics_labels::CONNECTION_HTTP,
+                                    error_type,
+                                );
+                            }
                         }
 
                         response
@@ -531,12 +539,16 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
     ) -> Response {
         let status = res.status();
+        // The failure is known as soon as headers arrive. Record it before
+        // reading the body so client cancellation cannot hide a worker fault.
+        // A synthetic error body must not record a second breaker outcome.
+        decode.record_outcome(status.is_client_error());
+        let retry_after = res.headers().get(http::header::RETRY_AFTER).cloned();
 
-        if context.is_stream {
+        let mut response = if context.is_stream {
             // Handle streaming error response
             let mut response_headers = header_utils::preserve_response_headers(res.headers());
             response_headers.remove(CONTENT_LENGTH);
@@ -565,17 +577,16 @@ impl PDRouter {
             };
 
             let sse_data = format!("data: {}\n\n", json!({ "error": error_payload }));
-            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
-
-            self.create_streaming_response(
-                error_stream,
-                status,
-                None,
-                context.return_logprob,
-                Some(response_headers),
-                prefill,
-                decode,
-            )
+            let mut response = Response::new(Body::from(sse_data));
+            *response.status_mut() = status;
+            *response.headers_mut() = response_headers;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+            response
         } else {
             // Handle non-streaming error response
             match res.bytes().await {
@@ -618,7 +629,10 @@ impl PDRouter {
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_bad_gateway", error_message)
                         }
-                        _ => error::internal_error("decode_error", error_message),
+                        StatusCode::TOO_MANY_REQUESTS => {
+                            error::create_error(status_code, "decode_rate_limited", error_message)
+                        }
+                        _ => error::create_error(status_code, "decode_error", error_message),
                     }
                 }
                 Err(e) => {
@@ -641,11 +655,17 @@ impl PDRouter {
                         StatusCode::BAD_GATEWAY => {
                             error::bad_gateway("decode_read_failed", error_message)
                         }
-                        _ => error::internal_error("decode_read_failed", error_message),
+                        _ => error::create_error(status_code, "decode_read_failed", error_message),
                     }
                 }
             }
+        };
+        if let Some(retry_after) = retry_after {
+            response
+                .headers_mut()
+                .insert(http::header::RETRY_AFTER, retry_after);
         }
+        response
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
@@ -707,10 +727,10 @@ impl PDRouter {
         }
         .emit();
 
-        let prefill_fut = prefill_request.send();
-        let decode_fut = decode_request.send();
-        tokio::pin!(prefill_fut);
-        tokio::pin!(decode_fut);
+        // Own the pinned futures so either failing leg can immediately drop
+        // the other connection, before reading an error response body.
+        let mut prefill_fut = Box::pin(prefill_request.send());
+        let mut decode_fut = Box::pin(decode_request.send());
 
         // Poll both until prefill resolves; decode normally resolves later, but
         // may resolve first if it rejects the request outright.
@@ -724,7 +744,32 @@ impl PDRouter {
                     break;
                 }
                 dr = &mut decode_fut, if decode_early.is_none() => {
-                    decode_early = Some(dr);
+                    match dr {
+                        Ok(response) if response.status().is_success() => {
+                            decode_early = Some(Ok(response));
+                        }
+                        failed => {
+                            // An admission rejection cannot bootstrap prefill.
+                            // Cancel P before consuming D's possibly slow error
+                            // body, and attribute the failure only to decode.
+                            drop(prefill_fut);
+                            let mut response = match failed {
+                                Ok(response) => {
+                                    self.handle_decode_error_response(
+                                        response,
+                                        &context,
+                                        Arc::clone(&decode),
+                                    ).await
+                                }
+                                Err(error) => {
+                                    decode.record_outcome(false);
+                                    error::bad_gateway("decode_server_error", format!("Decode server error: {error}"))
+                                }
+                            };
+                            response.extensions_mut().insert(BreakerOutcomesRecorded::Decode);
+                            return response;
+                        }
+                    }
                 }
             }
         }
@@ -740,6 +785,8 @@ impl PDRouter {
         };
 
         if prefill_failed {
+            drop(decode_fut);
+            drop(decode_early);
             warn!(
                 "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
                 decode.url(),
@@ -766,7 +813,9 @@ impl PDRouter {
                     "Prefill reported failure but returned a success response".to_string(),
                 ),
             };
-            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            response
+                .extensions_mut()
+                .insert(BreakerOutcomesRecorded::Prefill);
             return response;
         }
 
@@ -792,21 +841,10 @@ impl PDRouter {
                         status
                     );
 
-                    // Per-worker breaker attribution before the synthetic 5xx
-                    // response takes over. Prefill ran concurrently in the
-                    // `tokio::join!`: tick it based on its actual response
-                    // status, not on the decode-driven failure. For
-                    // non-streaming the response carries no tracked stream
-                    // so record decode's outcome here too — but treat 4xx
-                    // as a client fault rather than a worker fault, matching
-                    // the legacy outer-dispatcher rule and the streaming
-                    // `BreakerTrackedStream` pre-mark in
-                    // `create_streaming_response`. For streaming
-                    // `handle_decode_error_response` wraps the synthetic
-                    // error SSE in a `BreakerTrackedStream` that ticks
-                    // decode on drop, so skip to avoid double-counting.
-                    // Mark the response so the outer dispatcher skips its
-                    // status-derived `record_outcome`.
+                    // Record prefill's actual result. The error helper records
+                    // decode's result before awaiting its body. Mark the
+                    // response so outer dispatch cannot double-count either
+                    // worker or attribute D's failure to a healthy P.
                     let prefill_ok = match &prefill_result {
                         Ok(r) => {
                             let s = r.status();
@@ -815,15 +853,16 @@ impl PDRouter {
                         Err(_) => false,
                     };
                     prefill.record_outcome(prefill_ok);
-                    if !context.is_stream {
-                        let decode_ok = status.is_success() || status.is_client_error();
-                        decode.record_outcome(decode_ok);
-                    }
-
+                    // P may have returned headers while its body is still
+                    // pending. D cannot use it after rejection, so close it
+                    // before awaiting a possibly slow decode error body.
+                    drop(prefill_result);
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(res, &context, decode)
                         .await;
-                    response.extensions_mut().insert(BreakerOutcomesRecorded);
+                    response
+                        .extensions_mut()
+                        .insert(BreakerOutcomesRecorded::Decode);
                     return response;
                 }
 
@@ -939,7 +978,9 @@ impl PDRouter {
                     "decode_server_error",
                     format!("Decode server error: {}", e),
                 );
-                response.extensions_mut().insert(BreakerOutcomesRecorded);
+                response
+                    .extensions_mut()
+                    .insert(BreakerOutcomesRecorded::Decode);
                 response
             }
         }
@@ -1129,11 +1170,8 @@ impl PDRouter {
         // The upstream stream is wrapped in `BreakerTrackedStream` so the
         // decode worker's circuit breaker is updated once on drop: success
         // on clean completion (`[DONE]` sentinel or `None`), failure on
-        // stream error, neither on client disconnect. PD's pre-PR semantics
-        // treated 4xx (client error) as not-a-worker-fault, so we only
-        // pre-mark the wrapper as Errored on 5xx — `handle_decode_error_response`
-        // synthesizes a single-chunk SSE error envelope that would otherwise
-        // stream cleanly to None and record a spurious success.
+        // stream error, neither on client disconnect. Non-2xx error bodies
+        // are handled separately and record their known outcome immediately.
         let mut tracked =
             BreakerTrackedStream::new(stream, Arc::clone(&decode), decode.url().to_string());
         if !(status.is_success() || status.is_client_error()) {
@@ -1161,7 +1199,7 @@ impl PDRouter {
                                 // whether the client is still listening, and
                                 // the worker deserves the success tick either
                                 // way. `mark_completed` is a no-op once Errored
-                                // is set, so the synthetic-error path is unaffected.
+                                // is set.
                                 if is_done {
                                     tracked.mark_completed();
                                 }

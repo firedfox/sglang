@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
@@ -60,6 +61,33 @@ class HarmonyBrowserTool(Tool):
         content = TextContent(text=result_text)
         author = Author(role=Role.TOOL, name=recipient)
         return [Message(author=author, content=[content], recipient=Role.ASSISTANT)]
+
+    async def search(self, query: str) -> str:
+        from openai_harmony import Message, Role
+
+        from sglang.srt.entrypoints.context import HarmonyContext
+
+        search_call = (
+            Message.from_role_and_content(
+                Role.ASSISTANT,
+                json.dumps({"query": query}, ensure_ascii=False),
+            )
+            .with_channel("commentary")
+            .with_recipient("browser.search")
+            .with_content_type("json")
+        )
+        output_messages = await self.get_result(
+            HarmonyContext([search_call], {"browser": self})
+        )
+        chunks = [
+            content.text.strip()
+            for message in output_messages
+            for content in (getattr(message, "content", None) or [])
+            if isinstance(getattr(content, "text", None), str) and content.text.strip()
+        ]
+        if not chunks:
+            raise RuntimeError("builtin web_search returned no textual content")
+        return "\n\n".join(chunks)
 
     async def _dispatch_browser_call(
         self, context: "ConversationContext", recipient: str, args: dict[str, Any]

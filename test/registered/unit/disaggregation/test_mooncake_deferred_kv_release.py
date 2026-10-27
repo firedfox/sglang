@@ -159,6 +159,7 @@ class TestMooncakeAbortNotification(
         manager._staging_outstanding = defaultdict(int)
         manager.session_lock = threading.Lock()
         manager.session_failures = defaultdict(int)
+        manager.session_failure_threshold = 2
         manager.failed_sessions = set()
         manager.state_layout_rejections = {}
         manager.req_to_decode_prefix_len = {}

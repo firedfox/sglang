@@ -1,0 +1,303 @@
+{
+  "format_version": 1,
+  "base_revision": "71de97b264b04dcd514cf904003028aefe9775c8",
+  "patches": [
+    {
+      "name": "0003-3410a9a1.patch",
+      "sha256": "1eda33d9573a5396c7c03051115c940eb3a804dc7dca75eaf9a037beeda98476",
+      "stage": "baseline"
+    },
+    {
+      "name": "0004-44f893e8.patch",
+      "sha256": "f47a221b12d8f72a7980566200c89e4a7b4aceb99d89bc676df333323c50f149",
+      "stage": "baseline"
+    },
+    {
+      "name": "0005-e80328ed.patch",
+      "sha256": "29f6b780fae7a13e813e50f26950239069992823b7deb31c6c139007783b6f7d",
+      "stage": "baseline"
+    },
+    {
+      "name": "0006-193c1b42.patch",
+      "sha256": "e5d014a208d8010dc6d9cd9893ad324edab37f6b82c07f9328ed4e52f2622f55",
+      "stage": "baseline"
+    },
+    {
+      "name": "0007-a7b6af5e.patch",
+      "sha256": "c2ddb849589da9881642054b65418fa86c0cfd5c807c1634645afb5022dcfcb5",
+      "stage": "baseline"
+    },
+    {
+      "name": "0008-989cb357.patch",
+      "sha256": "774882a7ebf62bb3112553be23c2318f77e2b19dfafa2ae8ca343b29c4449c22",
+      "stage": "baseline"
+    },
+    {
+      "name": "0009-b9da69fb.patch",
+      "sha256": "4a141d943571cd042997e86dc8ea5e6b9448a0185a4d8d4b9fd85cf4346d3edb",
+      "stage": "baseline"
+    },
+    {
+      "name": "0010-c48e20a2.patch",
+      "sha256": "12bf321664d47b81ef94f73b8c4ccfb6de624a1bfb7203ee68cdfca076f4ae04",
+      "stage": "baseline"
+    },
+    {
+      "name": "0011-0a1deaea.patch",
+      "sha256": "6617f7b27f12f1ff1a1dcbe7a062261229b9aef67ee79af7c20a785dd95bcb89",
+      "stage": "baseline"
+    },
+    {
+      "name": "0012-42b19337.patch",
+      "sha256": "f09221d3992a93733a67d7c5e78717806d29d01da4c28568670feae3284f8e67",
+      "stage": "baseline"
+    },
+    {
+      "name": "0013-86bcbcc3.patch",
+      "sha256": "c644f6e987e8b2db8554f264efc829381b962ccc331ca428b79e1787c23f2a80",
+      "stage": "baseline"
+    },
+    {
+      "name": "0014-f7f331f9.patch",
+      "sha256": "01ef4f4466477d334b94d59ea910c75ba4d0c9459f3dc0c00bd4524780af6972",
+      "stage": "baseline"
+    },
+    {
+      "name": "0015-e3619b51.patch",
+      "sha256": "ee09c41a315cec2b381bc79f15b77900430a77038e2b8ace7d737c10dcee74cf",
+      "stage": "baseline"
+    },
+    {
+      "name": "0016-7acdacca.patch",
+      "sha256": "77de7af98d6cd0232e80973f8189da81be4f0c154e6980e4f3cbb25c756644de",
+      "stage": "baseline"
+    },
+    {
+      "name": "0017-f720595d.patch",
+      "sha256": "7c83d98f39d9ba2f96fccf40b46f365554ddfc9dbec73e8cf94e509eaa2a40b5",
+      "stage": "baseline"
+    },
+    {
+      "name": "0019-394485aa.patch",
+      "sha256": "e6355ce2b3bd5ba14cde60b04f793200b81d5bf4fcc2da13c05ce1cdc2a12a52",
+      "stage": "baseline"
+    },
+    {
+      "name": "0021-81656471.patch",
+      "sha256": "e6a9bcadf7c21be0635c27f9c1d6ae7988743ad0d52395ea6f0ce1577e082337",
+      "stage": "baseline"
+    },
+    {
+      "name": "0024-a18b66f5.patch",
+      "sha256": "51d7d1c45e1c7421f094f9ffe62e9e1d4987dbcc43b0d5ee21b226db7029f976",
+      "stage": "baseline"
+    },
+    {
+      "name": "0025-0fe5a860.patch",
+      "sha256": "8f24dd4a58297922bdb5f29880c04e3b394d4fb8e200252fa67a395dc10420d5",
+      "stage": "baseline"
+    },
+    {
+      "name": "0027-06dd5400.patch",
+      "sha256": "f09b61d19961488778768db21f5b624c3fe8bb1dbc15cfaa045805d3f444b896",
+      "stage": "baseline"
+    },
+    {
+      "name": "0028-da89535c.patch",
+      "sha256": "1312c4a193b746f163532a66b4cd35d1e1f1fc74b05e4da9e29178c358018934",
+      "stage": "baseline"
+    },
+    {
+      "name": "0029-af8d0fb9.patch",
+      "sha256": "1706799d6f6ac1cc641f7d6a803a8b149ed2849ec1cfebfd77062aaa9ee19090",
+      "stage": "baseline"
+    },
+    {
+      "name": "0030-127efec8.patch",
+      "sha256": "45ff1540fe92a1735d95f37ac562be688a5c166b3aa492ba0b2f6e3aba53f051",
+      "stage": "baseline"
+    },
+    {
+      "name": "0033-f20b0d30.patch",
+      "sha256": "d7b805dccea756c0ffbeb1cdcf6165b91df9a9dbfabf8e50f2ff3395dcc225d3",
+      "stage": "baseline"
+    },
+    {
+      "name": "0034-68e7b3cf.patch",
+      "sha256": "19fe58cf5ab3ae0247c5c2e97752621b3ff69b3f2528bb8936fbccfda09c8629",
+      "stage": "baseline"
+    },
+    {
+      "name": "0035-ecb07b92.patch",
+      "sha256": "df353935858796f3ccbc893f12b6b1ac49d5ffc4323bfc1011eeb41add177a2c",
+      "stage": "baseline"
+    },
+    {
+      "name": "0036-4dc4dfe5.patch",
+      "sha256": "fc0aaa4cb1d0907fb9e88b5c1c8066af4475e7a0e6647162e70b180ea9fd3b06",
+      "stage": "baseline"
+    },
+    {
+      "name": "0040-glm53-opt-backport.patch",
+      "sha256": "7d62ea7ba9b81af97c7ca40d4e6145b3183da2eef983f7ca661e4b77f6f454be",
+      "stage": "baseline"
+    },
+    {
+      "name": "0041-dp-admission-kvfix.patch",
+      "sha256": "7dc77cc4e3ab718ea48a73defdd972a3edbb3f7c5d9ccc512348778c177bccb7",
+      "stage": "baseline"
+    },
+    {
+      "name": "0042-dp-release-feedback.patch",
+      "sha256": "af6d4b4cbea6d9b52149ce1ceaf2e74753079695c1dba3e236cc2a1fa21c8c85",
+      "stage": "extension"
+    },
+    {
+      "name": "0043-prefill-time-diagnostics.patch",
+      "sha256": "233093140e1731335d4f28dd1dafc3f10c5cb2598900481fb7ceface56af7e8c",
+      "stage": "extension"
+    },
+    {
+      "name": "0044-l3-cost-diagnostics.patch",
+      "sha256": "3552132fb7200350ac90d08a14a322f143a201162edf7d5fdac702e5e714f753",
+      "stage": "extension"
+    }
+  ],
+  "states": {
+    "upstream": {
+      "python/sglang/srt/arg_groups/pd_disaggregation_hook.py": "5d4b5330a5375828179ed50f2708d68de90ecdde804832b252919b6a05a2a17e",
+      "python/sglang/srt/disaggregation/common/conn.py": "dc28d75e40b63163334b78e097b5eaa07ed768d596ce4c3903297cd20a3debf3",
+      "python/sglang/srt/disaggregation/decode.py": "0957981567fb988774af28e6a002053895e62b138e307d76820fbe78063f1112",
+      "python/sglang/srt/disaggregation/mooncake/conn.py": "5bfac4cc28ee29368d4f73e317be2c2bcf637738f28f03aa5ee81017bb9d45db",
+      "python/sglang/srt/disaggregation/prefill.py": "32ed50d6faad38bc9b7a4891420a370ef4d22d34631ae7dfccdaba104f9327da",
+      "python/sglang/srt/entrypoints/engine.py": "603dac58baf571804d4c279f4bf6b37476242a9cd2903d05181b955e935d748c",
+      "python/sglang/srt/entrypoints/http_server.py": "305a02a9238b62da90c9dc90ecbbdc0811ba7725f13056677e3ed7dbbfc81d4e",
+      "python/sglang/srt/entrypoints/openai/protocol.py": "c9aa0b5551bf5761c6e283391d70aebadb6708b69ba998cf21e00f05d2e3299f",
+      "python/sglang/srt/entrypoints/openai/serving_base.py": "3d0613b92abae51e8566a11ae80a2369a46422b49bd63c4cd6aa593d8a4bdbc2",
+      "python/sglang/srt/entrypoints/openai/serving_chat.py": "ac0bbdf37a86b49c9df0d513ba44b0c06feb23a28ffcde0b730500e560604ab1",
+      "python/sglang/srt/entrypoints/openai/serving_completions.py": "67f08075f21481b03e246327c7453f57ac001d0f3e78f5a9247caa553e1942e3",
+      "python/sglang/srt/entrypoints/openai/serving_responses.py": "fd0a230ba33186d514e95884cd20fd7d42956be148e39518f1db559135641517",
+      "python/sglang/srt/entrypoints/openai/usage_processor.py": "883c4c3ba95eb52fa57d5bf732d128063bac0b032f484776331220f61b7498a5",
+      "python/sglang/srt/entrypoints/tool.py": "2867140746cfde17ba0e7b82da4bad255226fd97df376c40922cd4fb704575b3",
+      "python/sglang/srt/environ.py": "e64b24813f8dc9af30644ce348642adbfb4fe6365a7d6e0044347439e5ecd1ed",
+      "python/sglang/srt/managers/cache_controller.py": "3f323c0b08acb8b1de6f3ff8c08f1ed34d508afd186ae61d370f4e1087d89974",
+      "python/sglang/srt/managers/data_parallel_controller.py": "9d10fb8f90cf9ab73527c4d7095702b9939210313d8af7234f93a06417025d2a",
+      "python/sglang/srt/managers/dp_admission.py": null,
+      "python/sglang/srt/managers/io_struct.py": "cc022f58fe2468fb6231c1e65a41106cbc0d73fe1bd784d6f57df94a412564a9",
+      "python/sglang/srt/managers/load_snapshot.py": "98432438fcfae4cea5990e4b7a95cd5297668bff979961863ffa3ba1b210fc8e",
+      "python/sglang/srt/managers/schedule_batch.py": "348cd231d705a618c3d4a80a356470f92a430a941c97b429a8b5d16336fd035c",
+      "python/sglang/srt/managers/schedule_policy.py": "7fa154986e574cabdbc341875401a59a7a388f94c548f11bf3d2bd7badc131d4",
+      "python/sglang/srt/managers/scheduler.py": "968a507c1919cb5293cc72a7dc033f2415cb27430c79cb00f0a3893a3b8e011c",
+      "python/sglang/srt/managers/scheduler_components/batch_result_processor.py": "702ecd7d908fb15b9c079e837ce72982492fd0cb1bf9436dcf0cdcd0d6c03873",
+      "python/sglang/srt/managers/scheduler_components/load_inquirer.py": "2d27be46e1cf70ed4164dd28ccc0b3a2be8967780a12a4e83b36f0a288ab2c1c",
+      "python/sglang/srt/managers/scheduler_components/metrics_reporter.py": "a77ebdff8bb61fb4700b66f2260c467cdd1c3f2cb0305067096e09eec8ad1275",
+      "python/sglang/srt/managers/scheduler_components/output_streamer.py": "4f069fbba82a77360fec29330edf5f6cf3740960984c5e1d01ef4e385c90ecaa",
+      "python/sglang/srt/managers/scheduler_components/prefill_time_budget.py": null,
+      "python/sglang/srt/managers/tokenizer_manager.py": "8102242c5094f8d444ac47232d3ae6113a70133a016791d9157864dada2fdad5",
+      "python/sglang/srt/managers/utils.py": "93354ebe8803308355173d9732db833b9d7a52f1002599c7215e989eca317445",
+      "python/sglang/srt/mem_cache/hiradix_cache.py": "1a88173716402ad9119ddf7dd07fb6cef663343827671dc84d5543581b88c903",
+      "python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py": "bc06826aeae69fa9702469d6a8606fba6efafe66433e402f9a8fd488dfdb1096",
+      "python/sglang/srt/mem_cache/prefetch_cost.py": null,
+      "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py": "d8232dc281bdc849df1dee9dd77b8ff4582818b3d46b0106c79a6cbc3729d7e5",
+      "python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py": "94e05781d363ddc80aa8badf356a8e02f378384dd6c0a4911d7a88a88ac92471",
+      "python/sglang/srt/mem_cache/unified_radix_cache.py": "4a395a6b652135753f9b92f0b01de63e497adbcdd44401f844e552b12346f57c",
+      "python/sglang/srt/observability/cache_metrics.py": null,
+      "python/sglang/srt/observability/cache_observation.py": null,
+      "python/sglang/srt/observability/metrics_collector.py": "9b2469b149e58d6e427dfafe82af073e61e04c825ff7d2b5dec138fd77b5c134",
+      "python/sglang/srt/observability/storage_io.py": null,
+      "python/sglang/srt/server_args.py": "5ed5badef8dca0ee3dd2b34a1c9c417e172ff1a947d9fe802f7983fb4a2be950",
+      "python/sglang/srt/utils/utf8_bom_middleware.py": null,
+      "python/sglang/srt/utils/watchdog.py": "79a9f3b5b8a9942692ad1dfec0f8371ffb8cd5712f952cc23beee0ddc2917da1"
+    },
+    "baseline": {
+      "python/sglang/srt/arg_groups/pd_disaggregation_hook.py": "3f8c86f465862b254cc802e312122d6a7e33c660cb6ee2e89d4dd02d78929b6f",
+      "python/sglang/srt/disaggregation/common/conn.py": "630a830450d0c172b531e03b9b7d9f4b1d96052fa965831bdab45b4764b8d307",
+      "python/sglang/srt/disaggregation/decode.py": "1af65697722bd339c4c6b9e55ebbcda32c189af0611c83a250b941711d092a8a",
+      "python/sglang/srt/disaggregation/mooncake/conn.py": "53682e9cdbd7fcb6b1cc3c66ac22cc53c083fe022d1622f4b76ec61cd67307e5",
+      "python/sglang/srt/disaggregation/prefill.py": "9832a29d3e669f259f5d2e659ca5f143536573fe6388fe2e53e0ca19d3a75d11",
+      "python/sglang/srt/entrypoints/engine.py": "5784eaed70bf08871b4a877317c671fba220ca8ffc88a6af3e4176c31aeb9278",
+      "python/sglang/srt/entrypoints/http_server.py": "721726ac17df308c839463941545bec7c2f425e8715fb69e931ad83d7eaac3f8",
+      "python/sglang/srt/entrypoints/openai/protocol.py": "dccee4781ffd12809fa890a347c7db8f86a5cc953508c8664c6043b8448e04cd",
+      "python/sglang/srt/entrypoints/openai/serving_base.py": "384e8ce8fb74e2e0835ecb0050b955363844fe30fa53fc5d94a64c0c60e70754",
+      "python/sglang/srt/entrypoints/openai/serving_chat.py": "321c3b59a874c8ce64037e8ac38275da4d8412446d0508cad70e22a883a5c61b",
+      "python/sglang/srt/entrypoints/openai/serving_completions.py": "bd742632d517187a86ca75208602c6a41d9bb798464eaea3c9d90fe2f452f263",
+      "python/sglang/srt/entrypoints/openai/serving_responses.py": "00e3b21784ff87a05058b1048298ec29c33827383343c6af9ac46a16cd3536d5",
+      "python/sglang/srt/entrypoints/openai/usage_processor.py": "694c8f29940fc5363831797a6a67e979d75ab7f915e954bca51892439a9d0fb7",
+      "python/sglang/srt/entrypoints/tool.py": "e91c80ca9b982ab4eafc7e44ec8ddf6091c16ef4aab518c9a147584ab6f771ec",
+      "python/sglang/srt/environ.py": "59109c497f017e0bb4840aa6b23b30b4e01af13490c1bb4884a88e5ea4d71ef0",
+      "python/sglang/srt/managers/cache_controller.py": "3b9d15f993fc7c1dc32695aa67dbf53fcf66864705cc923f9c1f41a487bdf526",
+      "python/sglang/srt/managers/data_parallel_controller.py": "3ebbb0b1741260f9037e4908e7a1ccd5ef064b67dbaa48837f8cb843e865f210",
+      "python/sglang/srt/managers/dp_admission.py": "a3c2047036086be381199dc0de2b22f16f6efa135fc609b97ea46b7879f97c65",
+      "python/sglang/srt/managers/io_struct.py": "5343604e7655d87d2f59e86b77ae1be068f36748df9b6ac7d0e1ab43eeb44b4b",
+      "python/sglang/srt/managers/load_snapshot.py": "068a3b805284a7437ee67808ed797e8e65f369581191572e784ddb3e15d79762",
+      "python/sglang/srt/managers/schedule_batch.py": "e6942122ef18fbc90009a9a99837c5a56599af6941e93410b9a4fc294fa10741",
+      "python/sglang/srt/managers/schedule_policy.py": "8f93f0762c0a7ac1c64d46e238a6b8aa3837d59c32cd1cfb7149956065d35b8a",
+      "python/sglang/srt/managers/scheduler.py": "2866ec7b7c599e3971fe0a3dc2b029c18a9736dbd55c941f921fb22b785e8a0a",
+      "python/sglang/srt/managers/scheduler_components/batch_result_processor.py": "2aa50d54a2427ee3a9c75572e9df92aa39a89cfe68cbaa7653e41a5d8e408abf",
+      "python/sglang/srt/managers/scheduler_components/load_inquirer.py": "b941c8dfa400d1e8808b8536b2d712fbc7a1cbbca18481ec13ee778e41c0830a",
+      "python/sglang/srt/managers/scheduler_components/metrics_reporter.py": "c8058fe9663d26da7e30394f130650d2ed67ed9bfa7f15345fbc42581a8641b0",
+      "python/sglang/srt/managers/scheduler_components/output_streamer.py": "4ca17b7034e347f66463f49d1b695a02b8349c395d5bde92bfa1239d2d128605",
+      "python/sglang/srt/managers/scheduler_components/prefill_time_budget.py": "b05a5c7cf5dbbb63acd2e538462a3c954a51b341503a8745c7f2ff9dcadda2b4",
+      "python/sglang/srt/managers/tokenizer_manager.py": "b2d05b4cd243cecc29957a8877ea843bbb15c68e4744408cdc728963f0ab9847",
+      "python/sglang/srt/managers/utils.py": "eb79c41388d5c19e615ae070eaa44cec0e486c05e2d78b8411bd31993858c70c",
+      "python/sglang/srt/mem_cache/hiradix_cache.py": "57c0b8d00df93c721d74979834434dffd9a3d9f8d60257b7e2e201430166121c",
+      "python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py": "5a926e7163177ed49bddfba606c63c23c2813ed954cdf644978602c2155ded4c",
+      "python/sglang/srt/mem_cache/prefetch_cost.py": "acca0b238ffc372b98dd3f70ad483443dbfad59ff0f559b9633e1ac34b13a5f8",
+      "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py": "8fac0cbba735dd0575855536489002698ab12fbbcc04bbd107135d8045c64399",
+      "python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py": "5e40a384bb4325b369f3bbdfd449a2ade5f80b80385a2c1024ac3d251d08fc89",
+      "python/sglang/srt/mem_cache/unified_radix_cache.py": "64268eb61b3d6118670fdcadbf941dd865fd050ab27930604a66217bca8edb6c",
+      "python/sglang/srt/observability/cache_metrics.py": "418dca347f61dab2b1f14dccbbe34b99c370a9c4d6ebca31a32a9b9697d21ca1",
+      "python/sglang/srt/observability/cache_observation.py": "6723d347d11e7ef651b5012d96decbd697abdfe4281c161ec404bb23e34dc811",
+      "python/sglang/srt/observability/metrics_collector.py": "33562406d614bd35034a84911af47effd83b5090ff6ff98e9fe6034144300e91",
+      "python/sglang/srt/observability/storage_io.py": "9600610346cefe16c35ea5c623b31a6b13dfdce3abbbfa70ab7f4592c5050984",
+      "python/sglang/srt/server_args.py": "08b279e123e309c7dccd63de87910eaf8f2ef4acf886eb2df0446f3924370341",
+      "python/sglang/srt/utils/utf8_bom_middleware.py": "262146c211725f9837a306b0fe14efa4d2fb8c7641d15a9a8fc6921094e13258",
+      "python/sglang/srt/utils/watchdog.py": "3b1f239b2846ada5add13db8bc540497e712f57ae97d6f3aa4155933577f46e1"
+    },
+    "candidate": {
+      "python/sglang/srt/arg_groups/pd_disaggregation_hook.py": "3f8c86f465862b254cc802e312122d6a7e33c660cb6ee2e89d4dd02d78929b6f",
+      "python/sglang/srt/disaggregation/common/conn.py": "630a830450d0c172b531e03b9b7d9f4b1d96052fa965831bdab45b4764b8d307",
+      "python/sglang/srt/disaggregation/decode.py": "1af65697722bd339c4c6b9e55ebbcda32c189af0611c83a250b941711d092a8a",
+      "python/sglang/srt/disaggregation/mooncake/conn.py": "53682e9cdbd7fcb6b1cc3c66ac22cc53c083fe022d1622f4b76ec61cd67307e5",
+      "python/sglang/srt/disaggregation/prefill.py": "9832a29d3e669f259f5d2e659ca5f143536573fe6388fe2e53e0ca19d3a75d11",
+      "python/sglang/srt/entrypoints/engine.py": "5784eaed70bf08871b4a877317c671fba220ca8ffc88a6af3e4176c31aeb9278",
+      "python/sglang/srt/entrypoints/http_server.py": "721726ac17df308c839463941545bec7c2f425e8715fb69e931ad83d7eaac3f8",
+      "python/sglang/srt/entrypoints/openai/protocol.py": "dccee4781ffd12809fa890a347c7db8f86a5cc953508c8664c6043b8448e04cd",
+      "python/sglang/srt/entrypoints/openai/serving_base.py": "384e8ce8fb74e2e0835ecb0050b955363844fe30fa53fc5d94a64c0c60e70754",
+      "python/sglang/srt/entrypoints/openai/serving_chat.py": "321c3b59a874c8ce64037e8ac38275da4d8412446d0508cad70e22a883a5c61b",
+      "python/sglang/srt/entrypoints/openai/serving_completions.py": "bd742632d517187a86ca75208602c6a41d9bb798464eaea3c9d90fe2f452f263",
+      "python/sglang/srt/entrypoints/openai/serving_responses.py": "00e3b21784ff87a05058b1048298ec29c33827383343c6af9ac46a16cd3536d5",
+      "python/sglang/srt/entrypoints/openai/usage_processor.py": "694c8f29940fc5363831797a6a67e979d75ab7f915e954bca51892439a9d0fb7",
+      "python/sglang/srt/entrypoints/tool.py": "e91c80ca9b982ab4eafc7e44ec8ddf6091c16ef4aab518c9a147584ab6f771ec",
+      "python/sglang/srt/environ.py": "59109c497f017e0bb4840aa6b23b30b4e01af13490c1bb4884a88e5ea4d71ef0",
+      "python/sglang/srt/managers/cache_controller.py": "3b9d15f993fc7c1dc32695aa67dbf53fcf66864705cc923f9c1f41a487bdf526",
+      "python/sglang/srt/managers/data_parallel_controller.py": "3ebbb0b1741260f9037e4908e7a1ccd5ef064b67dbaa48837f8cb843e865f210",
+      "python/sglang/srt/managers/dp_admission.py": "4c0a05517bb803de5ace6d33a8a6ce996652f42166e9521b5be57df7e5beb822",
+      "python/sglang/srt/managers/io_struct.py": "5343604e7655d87d2f59e86b77ae1be068f36748df9b6ac7d0e1ab43eeb44b4b",
+      "python/sglang/srt/managers/load_snapshot.py": "dce0515a993ba679f39cec781cca45b0600543daad912f3aef38faf935fe38a6",
+      "python/sglang/srt/managers/schedule_batch.py": "e6942122ef18fbc90009a9a99837c5a56599af6941e93410b9a4fc294fa10741",
+      "python/sglang/srt/managers/schedule_policy.py": "8ff48b0f6b337f5386bec1a5bca8fba55d1922d946997a857d0eda0ecd059f28",
+      "python/sglang/srt/managers/scheduler.py": "32e382659a8616222fd7687385e4f33cdd415d5980ffcfc4a24450c81010e49a",
+      "python/sglang/srt/managers/scheduler_components/batch_result_processor.py": "2aa50d54a2427ee3a9c75572e9df92aa39a89cfe68cbaa7653e41a5d8e408abf",
+      "python/sglang/srt/managers/scheduler_components/load_inquirer.py": "2698432b999ab4f32350f7d7ad3279273af669a253dfa4d5c9ad334b47adeba6",
+      "python/sglang/srt/managers/scheduler_components/metrics_reporter.py": "45d150253609a7ba60ef58e5d1307ce534b6037f93d3362c4ef10668cde6459f",
+      "python/sglang/srt/managers/scheduler_components/output_streamer.py": "4ca17b7034e347f66463f49d1b695a02b8349c395d5bde92bfa1239d2d128605",
+      "python/sglang/srt/managers/scheduler_components/prefill_time_budget.py": "234573d6c92600cde879f2d9dae9f819bca9cbfe1e5815fc80f782e5efd8cd61",
+      "python/sglang/srt/managers/tokenizer_manager.py": "b2d05b4cd243cecc29957a8877ea843bbb15c68e4744408cdc728963f0ab9847",
+      "python/sglang/srt/managers/utils.py": "eb79c41388d5c19e615ae070eaa44cec0e486c05e2d78b8411bd31993858c70c",
+      "python/sglang/srt/mem_cache/hiradix_cache.py": "57c0b8d00df93c721d74979834434dffd9a3d9f8d60257b7e2e201430166121c",
+      "python/sglang/srt/mem_cache/hybrid_cache/hybrid_cache_controller.py": "5a926e7163177ed49bddfba606c63c23c2813ed954cdf644978602c2155ded4c",
+      "python/sglang/srt/mem_cache/prefetch_cost.py": "59f2c386fc925e60a1fe58dd61d89d5ddcbbdfcde60be204b0f7346661cfe95d",
+      "python/sglang/srt/mem_cache/storage/mooncake_store/mooncake_store.py": "8fac0cbba735dd0575855536489002698ab12fbbcc04bbd107135d8045c64399",
+      "python/sglang/srt/mem_cache/unified_cache/unified_tree_core.py": "5e40a384bb4325b369f3bbdfd449a2ade5f80b80385a2c1024ac3d251d08fc89",
+      "python/sglang/srt/mem_cache/unified_radix_cache.py": "181532aefd023c4ad4caa169e5cd7cad7316d50a248341cc4d6b6e78e485e888",
+      "python/sglang/srt/observability/cache_metrics.py": "418dca347f61dab2b1f14dccbbe34b99c370a9c4d6ebca31a32a9b9697d21ca1",
+      "python/sglang/srt/observability/cache_observation.py": "6723d347d11e7ef651b5012d96decbd697abdfe4281c161ec404bb23e34dc811",
+      "python/sglang/srt/observability/metrics_collector.py": "33562406d614bd35034a84911af47effd83b5090ff6ff98e9fe6034144300e91",
+      "python/sglang/srt/observability/storage_io.py": "9600610346cefe16c35ea5c623b31a6b13dfdce3abbbfa70ab7f4592c5050984",
+      "python/sglang/srt/server_args.py": "08b279e123e309c7dccd63de87910eaf8f2ef4acf886eb2df0446f3924370341",
+      "python/sglang/srt/utils/utf8_bom_middleware.py": "262146c211725f9837a306b0fe14efa4d2fb8c7641d15a9a8fc6921094e13258",
+      "python/sglang/srt/utils/watchdog.py": "3b1f239b2846ada5add13db8bc540497e712f57ae97d6f3aa4155933577f46e1"
+    }
+  }
+}

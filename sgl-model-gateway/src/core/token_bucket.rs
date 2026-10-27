@@ -12,7 +12,7 @@ use tracing::{debug, trace};
 /// This implementation provides:
 /// - Smooth rate limiting with configurable refill rate
 /// - Burst capacity handling
-/// - Fair queuing for waiting requests via Notify
+/// - Wakeups for requests awaiting returned capacity
 /// - Sync token return for Drop handlers (via `return_tokens_sync`)
 ///
 /// Uses `parking_lot::Mutex` for sync-compatible locking (no async required).
@@ -97,50 +97,33 @@ impl TokenBucket {
             return Ok(());
         }
 
-        // When refill_rate=0 (pure concurrency limiting), tokens only come back
-        // via return_tokens(), so we wait on notify signal only.
-        if self.refill_rate == 0.0 {
-            debug!(
-                "Token bucket: waiting indefinitely for {} tokens (refill_rate=0)",
-                tokens
-            );
+        loop {
+            // Register before checking capacity: notify_waiters() does not retain
+            // a wakeup for a future waiter. A return racing with the failed fast
+            // path must be observed by either this check or the registered waiter.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.try_acquire_sync(tokens).is_ok() {
+                return Ok(());
+            }
 
-            loop {
-                // Wait for notify signal from return_tokens()
-                self.notify.notified().await;
-
-                if self.try_acquire(tokens).await.is_ok() {
-                    return Ok(());
+            if self.refill_rate == 0.0 {
+                notified.await;
+            } else {
+                let wait_time = {
+                    let inner = self.inner.lock();
+                    let wait_secs = ((tokens - inner.tokens) / self.refill_rate).max(0.0);
+                    Duration::from_secs_f64(wait_secs)
+                };
+                // The calculated refill time is a wakeup, not a deadline. Only
+                // acquire_timeout() owns the caller's admission deadline.
+                tokio::select! {
+                    _ = notified => {},
+                    _ = tokio::time::sleep(wait_time) => {},
                 }
             }
         }
-
-        let wait_time = {
-            let inner = self.inner.lock();
-            let tokens_needed = tokens - inner.tokens;
-            let wait_secs = (tokens_needed / self.refill_rate).max(0.0);
-            Duration::from_secs_f64(wait_secs)
-        };
-
-        debug!(
-            "Token bucket: waiting {:?} for {} tokens",
-            wait_time, tokens
-        );
-
-        tokio::time::timeout(wait_time, async {
-            loop {
-                if self.try_acquire(tokens).await.is_ok() {
-                    return;
-                }
-                tokio::select! {
-                    _ = self.notify.notified() => {},
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {},
-                }
-            }
-        })
-        .await?;
-
-        Ok(())
     }
 
     /// Acquire tokens with custom timeout.
@@ -275,5 +258,51 @@ mod tests {
         // Use sync return
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn refill_wait_is_not_an_early_admission_deadline() {
+        let bucket = TokenBucket::new(1, 100);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket
+            .acquire_timeout(1.0, Duration::from_secs(1))
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn zero_refill_admission_deadline_does_not_create_capacity() {
+        let bucket = TokenBucket::new(1, 0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+        assert!(bucket
+            .acquire_timeout(1.0, Duration::from_millis(10))
+            .await
+            .is_err());
+        assert!(bucket.try_acquire(1.0).await.is_err());
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).await.is_ok());
+    }
+
+    // Returning capacity and registering the waiter race on separate threads.
+    // Keep this explicit stress test in addition to the short default suite.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stress test; run explicitly with --ignored"]
+    async fn refill_zero_does_not_lose_wakeups_under_stress() {
+        for round in 0..200_000 {
+            let bucket = Arc::new(TokenBucket::new(1, 0));
+            assert!(bucket.try_acquire(1.0).await.is_ok());
+            let waiting_bucket = bucket.clone();
+            let waiting = tokio::spawn(async move {
+                waiting_bucket
+                    .acquire_timeout(1.0, Duration::from_secs(2))
+                    .await
+            });
+            let returning = tokio::spawn(async move { bucket.return_tokens_sync(1.0) });
+            returning.await.unwrap();
+            assert!(
+                waiting.await.unwrap().is_ok(),
+                "lost wakeup at round {round}"
+            );
+        }
     }
 }

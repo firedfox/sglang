@@ -364,9 +364,8 @@ class SchedulerBatchResultProcessor:
                         # req output_ids are set here
                         req.output_ids.append(next_token_id)
 
-                        self._maybe_update_reasoning_tokens(req, next_token_id)
-
                         req.update_finish_state()
+                        self._maybe_update_reasoning_tokens(req, next_token_id)
                     # A mixed spec tail committed its pending bonus token; advance
                     # so the next spec prepare_for_decode reserves from the right base.
                     if (
@@ -1035,13 +1034,13 @@ class SchedulerBatchResultProcessor:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accept_len = len(next_token_id)
-                self._maybe_update_reasoning_tokens(req, next_token_id)
             req.update_finish_state(new_accept_len)
 
             if sampling_mask_finish_reason is not None:
                 self._handle_sampling_mask_abort(req)
                 continue
 
+            self._maybe_update_reasoning_tokens(req, next_token_id)
             self._handle_finish_state_updated_req(req, batch, result, i, logits_output)
 
             if req.return_logprob:

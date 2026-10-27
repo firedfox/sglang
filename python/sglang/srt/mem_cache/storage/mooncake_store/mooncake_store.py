@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.srt.observability.metrics_collector import StorageMetrics
+from sglang.srt.observability.storage_io import StorageIOObserver
 
 DEFAULT_LOCAL_BUFFER_SIZE = 16 * 1024 * 1024  # 16 MB
 SETUP_TIMEOUT = 600  # 10min
@@ -618,6 +619,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.registered_pools = {}
 
             self.gb_per_page = None
+            self._io_observer = (
+                StorageIOObserver() if self.enable_storage_metrics else None
+            )
             self.prefetch_pgs = []
             self.backup_pgs = []
             self.prefetch_bandwidth = []
@@ -1000,6 +1004,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 for size in all_sizes
             ]
 
+        pool_label = prepared[0][0].value if len(prepared) == 1 else "mixed"
         if is_set:
             assert exist_result is not None
             io_results = [0 if state == 1 else -1 for state in exist_result]
@@ -1012,12 +1017,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self._filter_group_ids(
                         all_group_ids if all_group_ids else None, missing_idx
                     ),
+                    pool=pool_label,
                 )
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
         else:
             io_results = self._get_batch_zero_copy_impl(
-                all_key_strs, all_ptrs, all_sizes
+                all_key_strs, all_ptrs, all_sizes, pool=pool_label
             )
 
         results: dict = {}
@@ -1188,7 +1194,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             results[i : i + key_multiplier]
             for i in range(0, len(results), key_multiplier)
         ]
-        return [
+        page_results = [
             (
                 all(res == 0 for res in group)
                 if is_set_operate
@@ -1196,6 +1202,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             for group in result_groups
         ]
+        observer = getattr(self, "_io_observer", None)
+        if observer is not None:
+            observer.pages("put" if is_set_operate else "get", page_results)
+        return page_results
 
     def batch_get_v1(
         self,
@@ -1444,12 +1454,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def clear(self) -> None:
         self.store.remove_all()
 
+    def _observe_io(self, operation, keys, sizes, fn, *args, pool="unknown"):
+        observer = getattr(self, "_io_observer", None)
+        if observer is None:
+            return fn(*args)
+        return observer.call(operation, len(keys), sizes, fn, *args, pool=pool)
+
     def _put_batch_zero_copy_impl(
         self,
         key_strs: List[str],
         buffer_ptrs: List[Any],
         buffer_sizes: List[Any],
         group_ids: Optional[List[str]] = None,
+        *,
+        pool: str = "unknown",
     ) -> List[int]:
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
@@ -1463,24 +1481,70 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
+            return self._observe_io(
+                "put",
+                key_strs,
+                buffer_sizes,
+                self.store.batch_put_from_multi_buffers,
+                key_strs,
+                buffer_ptrs,
+                buffer_sizes,
+                config,
+                pool=pool,
             )
         elif config is not None:
-            return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
+            return self._observe_io(
+                "put",
+                key_strs,
+                buffer_sizes,
+                self.store.batch_put_from,
+                key_strs,
+                buffer_ptrs,
+                buffer_sizes,
+                config,
+                pool=pool,
             )
         else:
-            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
+            return self._observe_io(
+                "put",
+                key_strs,
+                buffer_sizes,
+                self.store.batch_put_from,
+                key_strs,
+                buffer_ptrs,
+                buffer_sizes,
+                pool=pool,
+            )
 
     def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
+        self,
+        key_strs: List[str],
+        buffer_ptrs: List[Any],
+        buffer_sizes: List[Any],
+        *,
+        pool: str = "unknown",
     ) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
+            return self._observe_io(
+                "get",
+                key_strs,
+                buffer_sizes,
+                self.store.batch_get_into_multi_buffers,
+                key_strs,
+                buffer_ptrs,
+                buffer_sizes,
+                pool=pool,
             )
-        return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+        return self._observe_io(
+            "get",
+            key_strs,
+            buffer_sizes,
+            self.store.batch_get_into,
+            key_strs,
+            buffer_ptrs,
+            buffer_sizes,
+            pool=pool,
+        )
 
     def _batch_exist(
         self, key_strs: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
@@ -1497,7 +1561,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 f"_{pp_rank}_".join(key.rsplit(f"_{self.pp_rank}_", 1))
                 for key in key_strs
             ]
-        return self.store.batch_is_exist(key_strs)
+        return self._observe_io(
+            "exists", key_strs, None, self.store.batch_is_exist, key_strs
+        )
 
     def get_stats(self):
         storage_metrics = StorageMetrics()
@@ -1509,4 +1575,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self.backup_pgs.clear()
         self.prefetch_bandwidth.clear()
         self.backup_bandwidth.clear()
+        if getattr(self, "_io_observer", None) is not None:
+            storage_metrics.io_stats, storage_metrics.page_stats = (
+                self._io_observer.drain()
+            )
         return storage_metrics

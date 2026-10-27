@@ -812,6 +812,23 @@ class Tool(BaseModel):
         return self
 
 
+class BuiltinWebSearchTool(BaseModel):
+    """Tencent-compatible builtin web search tool for Chat Completions."""
+
+    type: Literal["web_search", "web_search_preview"]
+    web_search: Optional[Dict[str, Any]] = None
+    model_config = ConfigDict(extra="allow")
+
+    def is_enabled(self) -> bool:
+        enabled = (self.web_search or {}).get("enable", True)
+        if isinstance(enabled, str):
+            return enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+        return bool(enabled)
+
+
+ChatTool: TypeAlias = Union[Tool, BuiltinWebSearchTool]
+
+
 # Tool is defined after the message params that reference it, so the forward
 # reference has to be resolved explicitly.
 ChatCompletionMessageGenericParam.model_rebuild()
@@ -894,7 +911,7 @@ class ChatCompletionRequest(PDRoutingFields):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     user: Optional[str] = None
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tools: Optional[List[ChatTool]] = Field(default=None, examples=[None])
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa

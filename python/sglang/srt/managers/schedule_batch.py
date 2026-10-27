@@ -2148,6 +2148,15 @@ class Req(ReqDllmMixin):
         if not isinstance(token_id, list):
             token_id = [token_id]
 
+        # Speculative decoding can commit multiple verified tokens at once. If
+        # a stop condition occurs in the middle of that run, output streaming
+        # truncates at finished_len, so reasoning usage must ignore the
+        # accepted-but-unemitted tail as well.
+        if self.finished_len is not None:
+            accepted_start = len(self.output_ids) - len(token_id)
+            emitted_len = max(0, min(len(token_id), self.finished_len - accepted_start))
+            token_id = token_id[:emitted_len]
+
         if self._think_end_matcher is None:
             self._think_end_matcher = TokenSequenceMatcher(think_end_ids)
 

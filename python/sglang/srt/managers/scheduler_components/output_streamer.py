@@ -31,6 +31,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.observability.cache_observation import emit_cache_summary
 from sglang.srt.runtime_context import get_observability, get_parallel, get_serving
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.server_args import ServerArgs
@@ -188,6 +189,7 @@ class SchedulerOutputStreamer:
                 continue
 
             acc.accept(req=req)
+            emit_cache_summary(req, logger)
             self._maybe_log_time_stats(req=req)
 
         if (
@@ -260,6 +262,7 @@ class SchedulerOutputStreamer:
         has_phs = False
         for req in reqs:
             if req.finished():
+                emit_cache_summary(req, logger)
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())

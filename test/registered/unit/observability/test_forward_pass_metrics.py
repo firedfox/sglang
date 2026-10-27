@@ -162,6 +162,15 @@ class TestForwardPassMetrics(unittest.TestCase):
         defaults.update(overrides)
         return types.SimpleNamespace(**defaults)
 
+    def test_decode_with_missing_cpu_seq_lens_uses_request_lengths(self):
+        requests = [_FakeReq(8, output_len=3), _FakeReq(16, output_len=5)]
+        batch = self._make_batch(reqs=requests, seq_lens_cpu=None)
+        metrics = self.reporter._build_scheduled_request_metrics(batch)
+        self.assertEqual(metrics.num_decode_requests, 2)
+        self.assertEqual(
+            metrics.sum_decode_kv_tokens, sum(req.seqlen for req in requests)
+        )
+
     def test_emit_mixed_batch_separates_prefill_and_decode(self):
         self.scheduler._fpm_dp_rank = 3
         self.scheduler.waiting_queue = [_FakeReq(6), _FakeReq(4, output_len=2)]

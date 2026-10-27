@@ -178,6 +178,25 @@ class TestSpecV2GrammarTruncation(CustomTestCase):
 
 
 class TestReasoningTokenAccounting(CustomTestCase):
+    def test_eos_inside_accepted_run_does_not_count_unemitted_tail(self):
+        for tokens, expected_count, closed in (
+            ([10, 42, 7, 8], 2, False),
+            ([10, 7, 8, 42, 11], 3, True),
+            ([10, 11, 12, 13], 4, False),
+        ):
+            with self.subTest(tokens=tokens):
+                req = _make_req(terminate_after=99)
+                req.grammar = None
+                req.require_reasoning = True
+                req.eos_token_ids = {42}
+                req.output_ids.extend(tokens)
+                req.update_finish_state(len(tokens))
+                proc = _make_processor()
+                proc.model_config.think_end_ids = [7, 8]
+                proc._maybe_update_reasoning_tokens(req, tokens)
+                self.assertEqual(req.reasoning_tokens, expected_count)
+                self.assertEqual(req._is_reasoning_over, closed)
+
     def test_multi_token_end_can_span_decode_steps(self):
         req = _make_req(terminate_after=99)
         req.require_reasoning = True

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import math
 import os
 import time
 from collections import Counter
@@ -2123,13 +2124,35 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
 
 @dataclass
 class StorageMetrics:
+    io_stats: Dict = field(default_factory=dict)
+    page_stats: Dict = field(default_factory=dict)
     prefetch_pgs: List[int] = field(default_factory=list)
     backup_pgs: List[int] = field(default_factory=list)
     prefetch_bandwidth: List[float] = field(default_factory=list)
     backup_bandwidth: List[float] = field(default_factory=list)
+    # Cumulative controller outcomes, not per-poll increments. Token volumes
+    # have separate metrics and are deliberately excluded from outcome labels.
+    prefetch_stats: Optional[Dict[str, float]] = None
 
 
 class StorageMetricsCollector(_StatLoggerDIMixin):
+    PREFETCH_OUTCOMES = (
+        "attempts",
+        "issued",
+        "issued_assumed_stored",
+        "declined_too_short",
+        "declined_rate_limited",
+        "declined_anchor_lost",
+        "declined_device_covered",
+        "declined_host_oversize",
+        "declined_unservable_prefix",
+        "revoked_insufficient",
+        "revoked_full_miss",
+        "stopped_cost_aware",
+        "stopped_deadline",
+        "l3_demand_requests",
+    )
+
     def __init__(
         self,
         labels: Dict[str, str],
@@ -2143,6 +2166,18 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         Histogram = self._histogram_cls or _PromHistogram
 
         self.labels = labels
+
+        self.storage_prefetch_outcomes_total = Counter(
+            name="sglang:storage_prefetch_outcomes_total",
+            documentation="Cumulative storage-prefetch controller outcomes. "
+            "Labels describe lifecycle events and may overlap for one request; "
+            "stopped_cost_aware and stopped_deadline count the first rank-agreed "
+            "stop only. Repeated polling does not add outcomes.",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+        self._last_prefetch_outcomes: Dict[str, float] = {}
+        for outcome in self.PREFETCH_OUTCOMES:
+            self.storage_prefetch_outcomes_total.labels(**labels, outcome=outcome)
 
         self.prefetched_tokens_total = Counter(
             name="sglang:prefetched_tokens_total",
@@ -2175,7 +2210,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap means the live device prefix diverged from the "
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
-            "reusable when cache-mode admission ran.",
+            "reusable when cache-mode admission ran; deadline means the "
+            "storage prefetch wait budget expired; cost_aware means the "
+            "estimated remaining read cost exceeded recomputation cost.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2184,6 +2221,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_capacity",
             "device_covered",
             "storage_transfer",
+            "deadline",
+            "cost_aware",
             "anchor_lost",
             "aux_window_trim",
             "device_overlap",
@@ -2329,6 +2368,29 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self._log_histogram(self.histogram_prefetch_bandwidth, v)
         for v in storage_metrics.backup_bandwidth:
             self._log_histogram(self.histogram_backup_bandwidth, v)
+        if storage_metrics.prefetch_stats is not None:
+            self.log_prefetch_outcomes(storage_metrics.prefetch_stats)
+
+    def log_prefetch_outcomes(self, snapshot: Mapping[str, float]) -> None:
+        """Export a cumulative snapshot once, with a fixed label vocabulary."""
+        for outcome in self.PREFETCH_OUTCOMES:
+            value = snapshot.get(outcome)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            try:
+                current = float(value)
+            except OverflowError:
+                continue
+            if not math.isfinite(current) or current < 0:
+                continue
+            previous = self._last_prefetch_outcomes.get(outcome, 0.0)
+            # A replacement/reset controller starts a fresh cumulative series.
+            delta = current - previous if current >= previous else current
+            if delta > 0:
+                self.storage_prefetch_outcomes_total.labels(
+                    **self.labels, outcome=outcome
+                ).inc(delta)
+            self._last_prefetch_outcomes[outcome] = current
 
 
 class ExpertDispatchCollector(_StatLoggerDIMixin):

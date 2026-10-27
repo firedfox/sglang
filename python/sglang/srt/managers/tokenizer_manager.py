@@ -893,6 +893,62 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.sampling_params_class = SamplingParams
         self.signal_handler_class = SignalHandler
 
+    @staticmethod
+    def _validate_dp_admission_request(
+        obj: Union[GenerateReqInput, EmbeddingReqInput],
+    ) -> None:
+        """Reject unsupported shapes before tokenization or transport allocation.
+
+        Scheduler-side reconstruction releases CUDA IPC slots, so rejecting an
+        already transported request in the DP controller alone is too late.
+        """
+        if not isinstance(obj, GenerateReqInput):
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail="DP admission supports text generation requests only.",
+            )
+
+        overrides = obj.positional_embed_overrides
+        has_overrides = overrides is not None and (
+            not isinstance(overrides, list)
+            or any(item is not None for item in overrides)
+        )
+        params = obj.sampling_params
+        params = params if isinstance(params, list) else [params]
+        has_beam = any((item.get("beam_width") or 1) > 1 for item in params)
+        if (
+            obj.contains_mm_input()
+            or obj.input_embeds is not None
+            or has_overrides
+            or obj.session_id is not None
+            or obj.session_params is not None
+            or has_beam
+            or obj.need_wait_for_mm_inputs
+            or obj.num_items_assigned is not None
+            or obj.encoder_urls is not None
+            or obj.return_bytes
+        ):
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "DP admission does not support multimodal or embedding inputs, "
+                    "sessions, beam search, encoder dispatch, or image generation."
+                ),
+            )
+
+        if obj.stream and not obj.is_single:
+            # Each sequence is admitted independently by the DP controller. A
+            # sibling can be rejected after another has already started an HTTP
+            # stream, when its status can no longer be changed. Reject this
+            # shape before creating request states or dispatching any sequence.
+            raise fastapi.HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "DP admission requires a single sequence for streaming "
+                    "requests; use stream=false for batches or n > 1."
+                ),
+            )
+
     async def generate_request(
         self,
         obj: Union[GenerateReqInput, EmbeddingReqInput],
@@ -902,6 +958,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         # Normalize the request
         obj.normalize_batch_and_arguments()
+        if get_parallel().enable_dp_admission:
+            self._validate_dp_admission_request(obj)
         self._set_default_priority(obj)
         if (
             isinstance(obj, GenerateReqInput)
@@ -1894,15 +1952,18 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state: ReqState,
         is_stream: bool,
     ) -> Optional[dict]:
-        """Returns the output dict to yield (stream abort), None for normal flow;
-        raises ValueError/HTTPException for non-stream aborts."""
+        """Return stream abort output, or raise for errors before HTTP headers.
+
+        DP admission rejects before dispatch, so even a streaming request must
+        expose its status to the PD router before it starts the response body.
+        """
         finish_reason = out["meta_info"]["finish_reason"]
 
         status_code = finish_reason.get("status_code")
-        if finish_reason.get("type") != "abort" or status_code not in (
-            HTTPStatus.BAD_REQUEST,
-            HTTPStatus.SERVICE_UNAVAILABLE,
-            HTTPStatus.INTERNAL_SERVER_ERROR,
+        if (
+            finish_reason.get("type") != "abort"
+            or not isinstance(status_code, int)
+            or not 400 <= status_code < 600
         ):
             return None
 
@@ -1913,6 +1974,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         release_task = self._release_lora_once(state)
         if release_task is not None:
             await release_task
+        if finish_reason.get("dp_admission_rejected"):
+            raise fastapi.HTTPException(
+                status_code=status_code, detail=finish_reason["message"]
+            )
         if not is_stream:
             if status_code == HTTPStatus.BAD_REQUEST:
                 raise ValueError(finish_reason["message"])

@@ -1,4 +1,5 @@
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -12,6 +13,10 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
     estimate_prefill_extend_tile_metrics,
 )
+from sglang.srt.managers.scheduler_components.prefill_time_budget import (
+    PrefillTimeBudget,
+    PrefillTimeModel,
+)
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
@@ -20,18 +25,23 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     DecLockRefResult,
     IncLockRefResult,
+    InsertParams,
     TreeLock,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, make_page_shard_spec
 from sglang.srt.mem_cache.prefill_budget import (
     PrefillBudget,
     SWAPrefillBudget,
     estimate_swa_kv_tokens,
 )
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_memory_pool import init_unified_swa_pools
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -216,6 +226,432 @@ class TestPrefillAdder(CustomTestCase):
         return self.create_adder(
             self.create_running_batch(), page_size=256, rem_chunk_tokens=chunk_tokens
         )
+
+    def _timed_adder(self, budget_ms, model=None, **kwargs):
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 100_000
+        options = dict(
+            page_size=4,
+            rem_chunk_tokens=64,
+            prefill_time_budget=PrefillTimeBudget(
+                model or PrefillTimeModel(linear_ms_per_token=1), budget_ms
+            ),
+        )
+        options.update(kwargs)
+        return self.create_adder(self.create_running_batch(), **options)
+
+    def _time_req(self, rid, extend=32, prefix=0):
+        req = self.create_mock_req(rid, priority=0, max_new_tokens=0)
+        req.prefix_len = prefix
+        req.full_untruncated_fill_ids = list(range(prefix + extend))
+        req.origin_input_ids = req.full_untruncated_fill_ids
+        req.last_node = MagicMock()
+        req.best_match_node = req.last_node
+        return req
+
+    def test_time_budget_caps_first_chunk_and_accounts_batch_fixed_cost(self):
+        adder = self._timed_adder(
+            10, PrefillTimeModel(fixed_ms=2, linear_ms_per_token=1)
+        )
+        req = self._time_req("first")
+        adder.add_one_req(req, False, None)
+        self.assertEqual(req.extend_len, 8)
+        self.assertIs(adder.new_chunked_req, req)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 10)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+        self.assertEqual(adder.prefill_time_overrun_requests, 0)
+        self.assertIs(adder.budget_state(), AddReqResult.OTHER)
+
+    def test_time_budget_continuation_uses_true_prefix_not_cache_hit_log_prefix(self):
+        model = PrefillTimeModel(quadratic_ms_per_token2=0.01)
+        adder = self._timed_adder(20, model)
+        req = self._time_req("continuation", extend=100, prefix=100)
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(req.extend_len, 8)
+        self.assertAlmostEqual(adder.prefill_time_budget.used_ms, 16.64)
+        self.assertEqual(adder.log_hit_tokens, 0)
+        self.assertTrue(adder._time_budget_has_continuation)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+
+    def test_time_diagnostics_distinguish_time_cuts_from_hard_caps_and_alignment(self):
+        cases = (
+            # budget, input cap, chunk cap, committed extend, time-limited
+            (9, 64, 64, 8, 1),
+            (1000, 10, 64, 8, 0),
+            (9, 10, 64, 8, 0),
+            (9, 64, 10, 8, 0),
+        )
+        for mode in ("first", "continuation", "ignore_eos"):
+            for budget, input_cap, chunk_cap, extend, limited in cases:
+                with self.subTest(
+                    mode=mode, budget=budget, input_cap=input_cap, chunk_cap=chunk_cap
+                ):
+                    adder = self._timed_adder(
+                        budget, rem_input_tokens=input_cap, rem_chunk_tokens=chunk_cap
+                    )
+                    req = self._time_req(mode, extend=128)
+                    self.mock_tree_cache.disable = mode == "ignore_eos"
+                    req.sampling_params.ignore_eos = mode == "ignore_eos"
+                    if mode == "continuation":
+                        adder.add_chunked_req(req)
+                    else:
+                        adder.add_one_req(req, False, None)
+                    self.assertEqual(req.extend_len, extend)
+                    self.assertEqual(adder.prefill_time_limited_requests, limited)
+                    self.assertEqual(adder.prefill_time_overrun_requests, 0)
+
+    def test_time_diagnostics_snapshot_committed_global_shapes(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        adder = self._timed_adder(20, PrefillTimeModel(quadratic_ms_per_token2=0.01))
+        req = self._time_req("snapshot", extend=100, prefix=100)
+        adder.add_chunked_req(req)
+        stats = PrefillStats.from_adder(adder, [])
+        self.assertEqual(stats.time_budget_ms, 20)
+        self.assertAlmostEqual(stats.time_estimated_ms, 16.64)
+        self.assertEqual(stats.time_limited_requests, 1)
+        self.assertEqual(stats.time_budget_overruns, 0)
+        self.assertEqual(
+            (
+                stats.time_sum_extend,
+                stats.time_sum_prefix_extend,
+                stats.time_sum_extend_squared,
+            ),
+            (8, 800, 64),
+        )
+        # The async logger must not observe a later continuation's shape.
+        req.prefix_len = 0
+        req.extend_end = 4
+        adder.prefill_time_budget.used_ms = 999
+        self.assertEqual(stats.time_sum_prefix_extend, 800)
+        self.assertAlmostEqual(stats.time_estimated_ms, 16.64)
+
+    def test_time_diagnostics_are_absent_when_policy_is_disabled(self):
+        from sglang.srt.managers.scheduler_components.metrics_reporter import (
+            PrefillStats,
+        )
+
+        adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=64)
+        stats = PrefillStats.from_adder(adder, [])
+        self.assertIsNone(stats.time_budget_ms)
+        self.assertIsNone(stats.time_estimated_ms)
+        self.assertEqual(stats.time_limited_requests, 0)
+
+    def test_time_budget_is_shared_by_complete_requests_in_batch(self):
+        adder = self._timed_adder(
+            18, PrefillTimeModel(fixed_ms=2, linear_ms_per_token=1)
+        )
+        first, second, third = (self._time_req(str(i), extend=8) for i in range(3))
+        adder.add_one_req(first, False, None)
+        adder.add_one_req(second, False, None)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 18)
+        self.assertEqual(adder.can_run_list, [first, second])
+        self.assertIs(adder.add_one_req(third, False, None), AddReqResult.OTHER)
+        self.assertEqual(adder.prefill_time_budget.admitted_requests, 2)
+
+    def test_time_budget_rejected_selection_does_not_spend_or_queue_load(self):
+        adder = self._timed_adder(
+            10, prefill_delayer_single_pass=_RecordingDelayer(False)
+        )
+        req = self._time_req("rejected")
+        req.host_hit_length = 16
+        req.needs_host_load_back.return_value = True
+        self.assertIs(adder.add_one_req(req, False, None), AddReqResult.OTHER)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 0)
+        self.assertEqual(adder.prefill_time_budget.admitted_requests, 0)
+        self.assertEqual(adder.prefill_time_limited_requests, 0)
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertIsNone(req.extend_end)
+
+    def test_time_budget_failed_load_reselects_without_double_charging(self):
+        adder = self._timed_adder(
+            10, PrefillTimeModel(fixed_ms=2, linear_ms_per_token=1)
+        )
+        req = self._time_req("load-miss")
+        req.host_hit_length = 24
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
+        with patch.object(
+            adder, "_select_prefill_admission", wraps=adder._select_prefill_admission
+        ) as select:
+            adder.add_one_req(req, False, None)
+        self.assertEqual(select.call_count, 2)
+        self.assertEqual((req.prefix_len, req.extend_len), (0, 8))
+        self.assertEqual(adder.prefill_time_budget.used_ms, 10)
+        self.assertEqual(adder.prefill_time_budget.admitted_requests, 1)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+
+    def test_time_budget_successful_host_hit_charges_final_prefix(self):
+        adder = self._timed_adder(
+            20, PrefillTimeModel(fixed_ms=2, quadratic_ms_per_token2=0.01)
+        )
+        req = self._time_req("hit")
+        req.host_hit_length = 24
+        req.needs_host_load_back.return_value = True
+        self.mock_tree_cache.init_load_back.return_value = (24, req.last_node)
+        adder.add_one_req(req, False, None)
+        self.assertEqual((req.prefix_len, req.extend_len), (24, 8))
+        self.assertAlmostEqual(adder.prefill_time_budget.used_ms, 6.48)
+        self.assertEqual(adder.prefill_time_budget.admitted_requests, 1)
+        self.assertEqual(adder.prefill_time_limited_requests, 0)
+
+    def test_time_budget_overdelivery_is_bounded_before_h2d_without_late_rejection(
+        self,
+    ):
+        adder = self._timed_adder(224, PrefillTimeModel(quadratic_ms_per_token2=1))
+        self.mock_tree_cache.mock_add_spec(UnifiedRadixCache)
+        self.mock_tree_cache.linker = None
+        self.mock_tree_cache.buffer_pipeline = None
+        self.mock_tree_cache.tree_core = MagicMock()
+        self.mock_tree_cache.tree_core.collect_path_info.return_value = (
+            (SimpleNamespace(path_end=24),),
+        )
+        req = self._time_req("aux-overdelivery")
+        req.needs_host_load_back.return_value = True
+        req.mamba_host_hit_length = 1
+
+        def load_back(params):
+            # An aux restore exposes resident FULL and consumes available slots.
+            self.mock_token_allocator.available_size.return_value = 0
+            return 24, req.last_node
+
+        self.mock_tree_cache.init_load_back.side_effect = load_back
+        with patch.object(
+            adder, "_select_prefill_admission", wraps=adder._select_prefill_admission
+        ) as select:
+            adder.add_one_req(req, False, None)
+        self.assertEqual(select.call_count, 1)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual((req.prefix_len, req.extend_len), (24, 4))
+        self.assertEqual(req.kv.cache_protected_len, 24)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 208)
+
+    def test_time_budget_aux_only_restore_failure_reselects_actual_prefix(self):
+        adder = self._timed_adder(
+            10, PrefillTimeModel(fixed_ms=2, linear_ms_per_token=1)
+        )
+        self.mock_tree_cache.mock_add_spec(UnifiedRadixCache)
+        self.mock_tree_cache.linker = None
+        self.mock_tree_cache.buffer_pipeline = None
+        self.mock_tree_cache.tree_core = MagicMock()
+        self.mock_tree_cache.tree_core.collect_path_info.return_value = (
+            (SimpleNamespace(path_end=24),),
+        )
+        req = self._time_req("aux-miss")
+        req.needs_host_load_back.return_value = True
+        req.mamba_host_hit_length = 1
+        self.mock_tree_cache.init_load_back.return_value = (0, req.last_node)
+        with patch.object(
+            adder, "_select_prefill_admission", wraps=adder._select_prefill_admission
+        ) as select:
+            adder.add_one_req(req, False, None)
+        self.assertEqual(select.call_count, 2)
+        self.assertEqual(select.call_args_list[0].kwargs["host_hit_length"], 24)
+        self.assertEqual(select.call_args_list[1].kwargs["host_hit_length"], 0)
+        self.assertEqual((req.prefix_len, req.extend_len), (0, 8))
+        self.assertEqual(adder.prefill_time_budget.used_ms, 10)
+        self.assertEqual(adder.prefill_time_budget.admitted_requests, 1)
+
+    def test_time_budget_host_overdelivery_aligns_against_final_prefix(self):
+        adder = self._timed_adder(10)
+        self.mock_tree_cache.mock_add_spec(UnifiedRadixCache)
+        self.mock_tree_cache.linker = None
+        self.mock_tree_cache.buffer_pipeline = None
+        self.mock_tree_cache.tree_core = MagicMock()
+        self.mock_tree_cache.tree_core.collect_path_info.return_value = (
+            (SimpleNamespace(path_end=11),),
+        )
+        req = self._time_req("aux-alignment")
+        req.needs_host_load_back.return_value = True
+        req.mamba_host_hit_length = 1
+        self.mock_tree_cache.init_load_back.return_value = (11, req.last_node)
+        adder.add_one_req(req, False, None)
+        self.assertEqual((req.prefix_len, req.extend_len), (11, 9))
+        self.assertEqual(req.extend_end % adder.page_size, 0)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 9)
+
+    def test_time_budget_fcfs_retains_only_one_unfinished_chunk_owner(self):
+        adder = self._timed_adder(2500, PrefillTimeModel(quadratic_ms_per_token2=1))
+        first = self._time_req("owner", extend=64, prefix=100)
+        short = self._time_req("short", extend=4)
+        long = self._time_req("other-long", extend=1000)
+        adder.add_one_req(first, False, None)
+        adder.add_one_req(short, False, None)
+        used = adder.prefill_time_budget.used_ms
+        self.assertIs(adder.add_one_req(long, False, None), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [first, short])
+        self.assertIs(adder.new_chunked_req, first)
+        self.assertEqual(adder.prefill_time_budget.used_ms, used)
+
+    def test_time_budget_continuation_allows_complete_peers_not_another_chunk(self):
+        adder = self._timed_adder(2500, PrefillTimeModel(quadratic_ms_per_token2=1))
+        adder.chunked_req_limit = 8
+        continuation = self._time_req("continuing", extend=64, prefix=100)
+        short = self._time_req("short", extend=4)
+        long = self._time_req("long", extend=1000)
+        self.assertIs(adder.add_chunked_req(continuation), continuation)
+        adder.add_one_req(short, True, None)
+        self.assertIs(adder.add_one_req(long, True, None), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [continuation, short])
+        self.assertIsNone(adder.new_chunked_req)
+
+    def test_time_budget_ignore_eos_keeps_absolute_alignment_and_true_prefix(self):
+        adder = self._timed_adder(60, PrefillTimeModel(quadratic_ms_per_token2=1))
+        self.mock_tree_cache.disable = True
+        req = self._time_req("ignore-eos", extend=20, prefix=3)
+        req.sampling_params.ignore_eos = True
+        adder.add_one_req(req, False, None)
+        self.assertEqual((req.extend_len, req.extend_end), (5, 8))
+        self.assertEqual(adder.prefill_time_budget.used_ms, 55)
+        self.assertEqual(adder.log_hit_tokens, 0)
+        self.assertIs(adder.new_chunked_req, req)
+
+    def test_time_budget_continuation_keeps_absolute_page_alignment(self):
+        adder = self._timed_adder(30)
+        req = self._time_req("page-aligned", extend=100, prefix=3)
+        adder.add_chunked_req(req)
+        self.assertEqual((req.extend_len, req.extend_end), (29, 32))
+        self.assertEqual(adder.prefill_time_budget.used_ms, 29)
+
+    def test_time_budget_preserves_relative_attention_query_alignment(self):
+        for mode in ("first", "continuation", "ignore_eos"):
+            with self.subTest(mode=mode):
+                adder = self._timed_adder(
+                    8192,
+                    page_size=64,
+                    rem_chunk_tokens=16384,
+                    rem_input_tokens=16384,
+                    truncation_align_size=4096,
+                )
+                req = self._time_req(mode, extend=20000, prefix=64)
+                self.mock_tree_cache.disable = mode == "ignore_eos"
+                req.sampling_params.ignore_eos = mode == "ignore_eos"
+                if mode == "continuation":
+                    adder.add_chunked_req(req)
+                else:
+                    adder.add_one_req(req, False, 4096)
+                self.assertEqual(req.extend_len, 8192)
+                self.assertEqual(req.extend_len % 4096, 0)
+                self.assertEqual(req.extend_end % 64, 0)
+                self.assertEqual(adder.prefill_time_budget.used_ms, 8192)
+
+    def test_time_budget_finishing_tail_is_allowed_below_alignment(self):
+        for mode in ("first", "continuation", "ignore_eos"):
+            with self.subTest(mode=mode):
+                adder = self._timed_adder(10, truncation_align_size=16)
+                req = self._time_req(mode, extend=2, prefix=3)
+                self.mock_tree_cache.disable = mode == "ignore_eos"
+                req.sampling_params.ignore_eos = mode == "ignore_eos"
+                if mode == "continuation":
+                    self.assertIsNone(adder.add_chunked_req(req))
+                else:
+                    adder.add_one_req(req, False, 16)
+                self.assertEqual(req.extend_len, 2)
+                self.assertEqual(adder.prefill_time_budget.used_ms, 2)
+
+    def test_time_budget_eagle_bigram_match_checkpoint_and_one_token_tail(self):
+        # Real CPU radix matching/checkpoint ownership; only device allocation
+        # and the model forward are omitted. EAGLE's raw boundary token is not
+        # an extra computed KV token in the time model.
+        rows = torch.arange(1, 257, dtype=torch.int64).reshape(1, -1)
+        req_pool = SimpleNamespace(
+            req_to_token=rows,
+            write=lambda index, value: rows.__setitem__(index, value),
+        )
+        self.mock_token_allocator.device = "cpu"
+        cache = RadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_pool,
+                token_to_kv_pool_allocator=self.mock_token_allocator,
+                page_size=64,
+                is_eagle=True,
+            )
+        )
+        seed = RadixKey(array("q", range(65)))
+        cache.insert(InsertParams(key=seed, value=rows[0, :65].clone()))
+        self.assertTrue(seed.is_bigram)
+        self.assertEqual(len(seed), 64)
+        req = Req(
+            "bigram-time-budget",
+            "",
+            array("q", range(129)),
+            SamplingParams(max_new_tokens=1),
+        )
+        req.init_next_round_input(cache)
+        self.assertEqual(req.prefix_len, 64)
+        model = PrefillTimeModel(quadratic_ms_per_token2=1)
+        adder = self._timed_adder(
+            12288, model, page_size=64, rem_chunk_tokens=128, tree_cache=cache
+        )
+        adder.add_one_req(req, False, None)
+        self.assertEqual(
+            (req.prefix_len, req.extend_len, req.extend_end), (64, 64, 128)
+        )
+        self.assertEqual(adder.prefill_time_budget.used_ms, 12288)
+        req.kv.req_pool_idx = 0
+        checkpoint_kv_cache(req, cache)
+        self.assertEqual(req.prefix_len, 128)
+        # The raw EAGLE boundary excludes the last page from the shared tree;
+        # the continuation still owns those KV tokens and uses the true prefix.
+        self.assertEqual(req.kv.cache_protected_len, 64)
+        continuation = self._timed_adder(
+            0.1, model, page_size=64, rem_chunk_tokens=128, tree_cache=cache
+        )
+        with self.assertLogs(schedule_policy.logger, level="WARNING"):
+            self.assertIsNone(continuation.add_chunked_req(req))
+        self.assertEqual(
+            (req.prefix_len, req.extend_len, req.extend_end), (128, 1, 129)
+        )
+        self.assertEqual(continuation.prefill_time_budget.used_ms, 257)
+        self.assertEqual(continuation.can_run_list, [req])
+        cache.unlock(req.lock)
+
+    def test_time_budget_minimum_progress_does_not_apply_to_nonempty_batch(self):
+        adder = self._timed_adder(0.1)
+        first, second = self._time_req("first"), self._time_req("second")
+        with self.assertLogs(schedule_policy.logger, level="WARNING") as logs:
+            adder.add_one_req(first, False, None)
+        self.assertIn("minimum aligned chunk", " ".join(logs.output))
+        self.assertEqual(first.extend_len, 4)
+        self.assertIs(adder.add_one_req(second, False, None), AddReqResult.OTHER)
+        self.assertEqual(adder.can_run_list, [first])
+        self.assertEqual(adder.prefill_time_budget.used_ms, 4)
+        self.assertEqual(adder.prefill_time_limited_requests, 1)
+        self.assertEqual(adder.prefill_time_overrun_requests, 1)
+
+    def test_time_budget_never_expands_chunk_or_prefill_token_caps(self):
+        for mode in ("first", "continuation", "ignore_eos"):
+            for input_cap, chunk_cap, expected in ((12, 64, 12), (64, 8, 8)):
+                with self.subTest(mode=mode, input_cap=input_cap, chunk_cap=chunk_cap):
+                    adder = self._timed_adder(
+                        1000, rem_input_tokens=input_cap, rem_chunk_tokens=chunk_cap
+                    )
+                    req = self._time_req(mode, extend=128)
+                    self.mock_tree_cache.disable = mode == "ignore_eos"
+                    req.sampling_params.ignore_eos = mode == "ignore_eos"
+                    if mode == "continuation":
+                        adder.add_chunked_req(req)
+                    else:
+                        adder.add_one_req(req, False, None)
+                    self.assertEqual(req.extend_len, expected)
+                    self.assertGreaterEqual(adder.rem_input_tokens, 0)
+                    self.assertGreaterEqual(adder.rem_chunk_tokens, 0)
+
+    def test_time_budget_keeps_memory_rejection_and_continuation_fit_bound(self):
+        adder = self._timed_adder(1000)
+        req = self._time_req("memory-rejected", extend=128)
+        self.mock_token_allocator.available_size.return_value = 64
+        self.assertIs(adder.add_one_req(req, False, None), AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 0)
+        self.mock_token_allocator.available_size.return_value = 100_000
+        with patch.object(adder.memory_budget, "fit_chunk", return_value=8):
+            adder.add_chunked_req(req)
+        self.assertEqual(req.extend_len, 8)
+        self.assertEqual(adder.prefill_time_budget.used_ms, 8)
 
     def test_shortest_prefill_reserves_space_for_complete_waiting_requests(self):
         adder = self.create_shortest_prefill_adder()

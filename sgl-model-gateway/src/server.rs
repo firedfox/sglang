@@ -33,7 +33,7 @@ use crate::{
         worker_manager::WorkerManager,
         Job,
     },
-    middleware::{self, AuthConfig, QueuedRequest},
+    middleware::{self, AuthConfig, ConcurrencyQueue},
     observability::{
         logging::{self, LoggingConfig},
         metrics::{self, PrometheusConfig},
@@ -71,7 +71,7 @@ use crate::{
 pub struct AppState {
     pub router: Arc<dyn RouterTrait>,
     pub context: Arc<AppContext>,
-    pub concurrency_queue_tx: Option<tokio::sync::mpsc::Sender<QueuedRequest>>,
+    pub concurrency_queue_tx: Option<ConcurrencyQueue>,
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,

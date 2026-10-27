@@ -54,6 +54,7 @@ class SchedulerLoadInquirer:
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_dp_admission_snapshot: Callable[[int], dict] | None = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -95,7 +96,20 @@ class SchedulerLoadInquirer:
     def get_loads(self) -> LoadSnapshot:
         """Build the per-DP-rank load snapshot for DP balancing and /v1/loads."""
         stats = self.get_stats()
-        num_running_reqs = len(self.get_running_batch().reqs)
+        running_reqs = self.get_running_batch().reqs
+        num_running_reqs = len(running_reqs)
+        if self.get_dp_admission_snapshot is not None:
+            # Admission snapshots can now be published just after processing a
+            # result, before the next scheduling step filters finished rows.
+            # Do not let those stale references hide a released request slot.
+            # A terminal request that still owns deferred KV remains counted.
+            num_running_reqs -= sum(
+                bool(req.finished_output)
+                and not req.kv.holds_kv
+                and not req.kv.holds_mamba
+                and req.kv.retraction_backup is None
+                for req in running_reqs
+            )
 
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
@@ -213,6 +227,11 @@ class SchedulerLoadInquirer:
         decode_moments = list(totals) if totals[0] > 0 else None
 
         return LoadSnapshot(
+            **(
+                self.get_dp_admission_snapshot(num_used_tokens)
+                if self.get_dp_admission_snapshot is not None
+                else {}
+            ),
             dp_rank=int(get_parallel().dp_rank)
             if get_parallel().dp_rank is not None
             else 0,

@@ -622,6 +622,55 @@ class SchedulerDisaggregationPrefillMixin:
             for req in self.waiting_queue
         )
 
+    def retry_hicache_prefetch_capacity_head_in_bootstrap(self: Scheduler) -> None:
+        """Retry only the oldest capacity waiter before it leaves bootstrap."""
+        if not getattr(self, "enable_hicache_storage", False):
+            return
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        if controller is None or not getattr(
+            controller, "prefetch_capacity_retry", False
+        ):
+            return
+        waiters = controller.prefetch_capacity_waiter_rids
+        if not waiters:
+            return
+        head_rid = waiters[0]
+        for req in self.disagg_prefill_bootstrap_queue.queue:
+            if req.rid != head_rid:
+                continue
+            pending_tokens = self.tree_cache.prefetch_capacity_pending_tokens(
+                req.cache_request_handle
+            )
+            if pending_tokens <= 0:
+                controller.release_prefetch_capacity_waiter(head_rid)
+            elif not controller.prefetch_rate_limited(pending_tokens, head_rid):
+                started_at = getattr(
+                    controller, "prefetch_capacity_waiter_since", {}
+                ).get(head_rid)
+                self._prefetch_kvcache(req)
+                if self.tree_cache.prefetch_capacity_pending_tokens(
+                    req.cache_request_handle
+                ) == 0 and getattr(
+                    getattr(self, "metrics_reporter", None),
+                    "is_stats_logging_rank",
+                    False,
+                ):
+                    now = time.monotonic()
+                    last_log = getattr(self, "_hicache_prefetch_retry_last_log", None)
+                    if last_log is None or now - last_log >= 10.0:
+                        self._hicache_prefetch_retry_last_log = now
+                        logger.info(
+                            "HiCache prefetch_capacity_retry rid=%s pending_tokens=%d "
+                            "wait_seconds=%s next_head_rid=%s",
+                            head_rid,
+                            pending_tokens,
+                            round(max(0.0, now - started_at), 3)
+                            if started_at is not None
+                            else None,
+                            waiters[0] if waiters else None,
+                        )
+            return
+
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_disagg_prefill_batch_to_run(
         self: Scheduler,
@@ -638,6 +687,7 @@ class SchedulerDisaggregationPrefillMixin:
         # Otherwise, it hangs under high concurrency
         running_batch.batch_is_full = False
 
+        self.retry_hicache_prefetch_capacity_head_in_bootstrap()
         self.resolve_waiting_queue_bootstrap()
 
         # Skip repeated chunk processing while polling a pending batch.

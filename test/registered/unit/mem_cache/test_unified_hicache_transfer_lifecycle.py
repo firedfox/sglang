@@ -408,7 +408,16 @@ class _UnifiedHiCacheCase(_ConfigCase):
         ):
             cache = UnifiedRadixCache(params=params)
         # CPU host tensors need no page-locking.
-        with mock.patch.object(host_memory, "_cuda_host_register"):
+        # These pools have a few KiB of CPU tensors. Model the host allowance
+        # explicitly so the production safety reserve does not require a large
+        # test container merely to exercise transfer ownership.
+        with (
+            mock.patch.object(host_memory, "_cuda_host_register"),
+            mock.patch(
+                "sglang.srt.mem_cache.pool_host.base.available_host_memory_bytes",
+                return_value=64 * 1024**3,
+            ),
+        ):
             cache.init_hicache(server_args, params)
         atexit.unregister(cache.shutdown)
         self.addCleanup(cache.release_host_resources)

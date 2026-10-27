@@ -479,6 +479,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def reset(self) -> None:
         """Rebuild the root, LRUs, sizes, evictable-leaf sets, and the empty
         match result."""
+        observer = getattr(self, "mutation_observer", None)
+        if observer is not None:
+            observer.reset()
         # End suspended walks while their session-cursor sentinels still
         # belong to the old LRUs, clearing any pending internal victim.
         for component in self.components:
@@ -912,6 +915,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         best_match_node = node
         best_match_device_node = node
         best_match_device_value_len = 0
+        device_prefix_contiguous = True
         full_kv_hit_length = 0
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
@@ -940,11 +944,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 best_match_node = node
 
             if not separate_device_match:
-                if matched:
+                if matched and device_prefix_contiguous:
                     best_match_device_value_len = len(value)
                     best_match_device_node = node
                 return
-            if _all_valid(device_validators, node):
+            if device_prefix_contiguous and _all_valid(device_validators, node):
                 best_match_device_value_len = len(value)
                 best_match_device_node = node
 
@@ -959,13 +963,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             full_kv_hit_length += prefix_len
             if prefix_len < len(child.key):
                 node, action = self._split_node(child.key, child, prefix_len)
-                if not node.evicted:
+                if device_prefix_contiguous and not node.evicted:
                     value.append(node.component_data[BASE_COMPONENT_TYPE].value)
+                else:
+                    device_prefix_contiguous = False
                 _update_best_if_valid(node)
                 break
 
-            if not child.evicted:
+            if device_prefix_contiguous and not child.evicted:
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
+            else:
+                device_prefix_contiguous = False
             node = child
             _update_best_if_valid(node)
             key_offset += prefix_len
@@ -1831,12 +1839,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.device_frees,
                 result.host_frees,
             )
-            self._remove_leaf_from_parent(desc)
+            self._remove_leaf_from_parent(desc, "write_back_subtree_drop")
         self._delete_unbacked_device_leaf(
             node,
             result.tracker,
             device_frees=result.device_frees,
             host_frees=result.host_frees,
+            reason="write_back_backup_failed_subtree_drop",
         )
         result.is_dropped = True
         return result
@@ -1870,13 +1879,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        reason: str = "write_through_device_evicted",
     ) -> None:
         """Delete a device leaf that has no host backup, freeing all layers."""
         self._release_all_component_layers(
             node, StorageMedium.GPU, tracker, device_frees, host_frees
         )
         parent = node.parent
-        self._remove_leaf_from_parent(node)
+        self._remove_leaf_from_parent(node, reason)
         self._update_evictable_leaf_sets(parent)
         self._iteratively_delete_tombstone_leaf(
             node, tracker, device_frees=device_frees, host_frees=host_frees
@@ -1984,6 +1994,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             device_frees=device_frees,
             host_frees=host_frees,
         )
+        self._record_node_mutation(node, "host_duplicate_reclaimed")
         self.write_back_duplicate_reclaim_digest = (
             self.write_back_duplicate_reclaim_digest * 1000003 + node.id + 1
         ) & _RECLAIM_DIGEST_MASK
@@ -2012,7 +2023,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             )
             tracker[comp.component_type] += hf
         self.evictable_host_leaves.discard(node)
-        self._remove_leaf_from_parent(node)
+        self._remove_leaf_from_parent(node, "host_leaf_evicted")
         self._iteratively_delete_tombstone_leaf(node, tracker, device_frees, host_frees)
 
     def demote(self, node_id: NodeId) -> DemoteResult:
@@ -2054,6 +2065,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             node, UnifiedLRUList.insert_mru, target=EvictLayer.HOST, skip_existing=True
         )
         self._update_evictable_leaf_sets(node.parent)
+        self._record_node_mutation(node, "device_demoted_to_host")
 
     def _cascade_evict(
         self,
@@ -2140,13 +2152,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             assert cd.host_lock_ref == 0
         return True
 
-    def _remove_leaf_from_parent(self, node: UnifiedTreeNode):
+    def _record_node_mutation(self, node: UnifiedTreeNode, action: str) -> None:
+        observer = getattr(self, "mutation_observer", None)
+        if observer is not None:
+            observer.record(node.id, action, len(node.key))
+
+    def _remove_leaf_from_parent(
+        self, node: UnifiedTreeNode, reason: str = "node_deleted"
+    ):
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
         key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
+        self._record_node_mutation(node, reason)
         # Deleted nodes must not linger in duplicate tracking as ghosts.
         self.full_host_duplicates.pop(node.id, None)
         self._unregister_node(node)
@@ -2258,7 +2278,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     )
 
             self.evictable_host_leaves.discard(cur)
-            self._remove_leaf_from_parent(cur)
+            self._remove_leaf_from_parent(cur, "tombstone_deleted")
             parent = cur.parent
             self._update_evictable_leaf_sets(parent)
             cur = parent
@@ -3184,6 +3204,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             nodes.append(node)
             stack.extend(node.children.values())
         return nodes
+
+    def host_protected_full_tokens(self) -> tuple[int, int]:
+        """Count unique Full Host slots held by host locks and their ancestors.
+
+        Host eviction proceeds from leaves, so a locked descendant also keeps
+        its Host-backed ancestors resident. Count each node once when locks
+        overlap; device-only nodes contribute no Host payload.
+        """
+        protected_ids = set()
+        references = 0
+        tokens = 0
+        for node in self._collect_all_nodes():
+            data = node.component_data[BASE_COMPONENT_TYPE]
+            if data.host_lock_ref <= 0:
+                continue
+            references += data.host_lock_ref
+            while node is not None and node.id not in protected_ids:
+                protected_ids.add(node.id)
+                host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
+                if host_value is not None:
+                    tokens += len(host_value)
+                node = node.parent
+        return tokens, references
 
     def _check_lru_linked_list(
         self,

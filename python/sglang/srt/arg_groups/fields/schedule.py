@@ -64,6 +64,23 @@ class Schedule(msgspec.Struct):
         bool,
         "Enable dynamic chunk size adjustment for pipeline parallelism. When enabled, chunk sizes are dynamically calculated based on fitted function to maintain consistent execution time across chunks.",
     ] = False
+    prefill_time_budget_ms: A[
+        Optional[float],
+        "Optional estimated compute-time budget in milliseconds for each "
+        "non-PP prefill batch. Requires --prefill-time-model and chunked "
+        "prefill. A minimum aligned chunk may exceed this soft budget in an "
+        "empty batch so requests make progress; existing token/memory limits "
+        "remain binding. This is not a wall-clock deadline.",
+    ] = None
+    prefill_time_model: A[
+        Optional[str],
+        "JSON calibration for --prefill-time-budget-ms: fixed_ms, "
+        "linear_ms_per_token, quadratic_ms_per_token2 (all default to 0). "
+        "Values must be finite and nonnegative, with at least one positive "
+        "token-cost coefficient. fixed_ms is charged once per batch. "
+        "Calibrate logical token lengths for the complete TP/CP group; "
+        "no rank-local timing or automatic calibration is performed.",
+    ] = None
     max_prefill_tokens: A[
         int,
         Arg(

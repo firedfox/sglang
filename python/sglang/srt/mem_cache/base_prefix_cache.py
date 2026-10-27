@@ -603,6 +603,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """
         return True
 
+    def prefetch_capacity_pending_tokens(self, handle: CacheRequestHandle) -> int:
+        """Tokens waiting for the optional host-capacity FIFO gate."""
+        return 0
+
+    def release_prefetch_capacity_waiter(self, handle: CacheRequestHandle) -> None:
+        """Retire a capacity waiter when no storage operation is needed."""
+
     def finish_storage_prefetch_admission(
         self,
         handle: CacheRequestHandle,

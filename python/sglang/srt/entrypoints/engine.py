@@ -56,6 +56,7 @@ from sglang.srt.arg_groups.overrides import (
     resolved_view,
     resolving_view,
 )
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.elastic_ep.expert_backup_manager import run_expert_backup_manager
 from sglang.srt.entrypoints.engine_info_bootstrap_server import (
     EngineInfoBootstrapServer,
@@ -160,6 +161,28 @@ from sglang.srt.weight_cache.protocol import (
     get_ready_path,
 )
 from sglang.version import __version__
+
+
+def _scheduler_watchdog_metrics(process_names):
+    scheduler_names = set(process_names)
+    if (
+        get_parallel().num_dp_ranks > 1 or get_exec().moe.ep_join_mode == "scale"
+    ) and process_names:
+        scheduler_names.discard(process_names[0])
+    return dict(
+        metrics_labels=(
+            {
+                "model_name": get_serving().served_model_name,
+                "engine_type": DisaggregationMode.to_engine_type(
+                    get_disagg().disaggregation_mode
+                ),
+            }
+            if get_observability().enable_metrics
+            else None
+        ),
+        metrics_process_names=scheduler_names,
+    )
+
 
 logger = logging.getLogger(__name__)
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
@@ -1008,7 +1031,12 @@ class Engine(EngineScoreMixin, EngineBase):
         def block_until_scheduler_exits():
             watchdog = None
             if prelaunch_dp_schedulers and get_parallel().node_rank > 0:
-                watchdog = SubprocessWatchdog(scheduler_procs)
+                names = [f"scheduler_{i}" for i in range(len(scheduler_procs))]
+                watchdog = SubprocessWatchdog(
+                    scheduler_procs,
+                    process_names=names,
+                    **_scheduler_watchdog_metrics(names),
+                )
                 watchdog.start()
             try:
                 for proc in scheduler_procs:
@@ -1299,7 +1327,9 @@ class Engine(EngineScoreMixin, EngineBase):
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
             subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
+                processes=processes,
+                process_names=names,
+                **_scheduler_watchdog_metrics(names),
             )
             subprocess_watchdog.start()
 
@@ -1348,10 +1378,13 @@ class Engine(EngineScoreMixin, EngineBase):
             # Note: RayEngine returns scheduler_procs=None as it uses Ray actors instead of mp.Process
             processes = list(scheduler_procs or [])
             names = [f"scheduler_{i}" for i in range(len(processes))]
+            watchdog_metrics = _scheduler_watchdog_metrics(names)
             processes.extend(detoken_procs)
             names.extend(detoken_names)
             subprocess_watchdog = SubprocessWatchdog(
-                processes=processes, process_names=names
+                processes=processes,
+                process_names=names,
+                **watchdog_metrics,
             )
             subprocess_watchdog.start()
             startup_complete = True

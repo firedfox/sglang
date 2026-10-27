@@ -17,12 +17,14 @@ limitations under the License.
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Callable, List, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     STORAGE_BATCH_SIZE,
     HiCacheStorageConfig,
@@ -31,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     count_pool_hits,
 )
+from sglang.srt.observability.cache_observation import CacheOperationObservation
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -239,6 +242,7 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        self.cache_observation = CacheOperationObservation(len(token_ids))
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -251,6 +255,7 @@ class StorageOperation:
         self.storage_start = 0
 
         self.id = StorageOperation.counter
+        self.cache_observation.operation_id = self.id
         StorageOperation.counter += 1
 
     def __lt__(self, other: StorageOperation):
@@ -335,6 +340,13 @@ class HiCacheController:
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage_metrics = enable_storage_metrics
+        self.prefetch_capacity_retry = envs.SGLANG_HICACHE_PREFETCH_CAPACITY_RETRY.get()
+        self.prefetch_capacity_waiter_rids: List[str] = []
+        self.prefetch_capacity_waiter_since: dict[str, float] = {}
+        self.prefetch_capacity_waiter_events = deque(maxlen=64)
+        self.prefetch_capacity_head_events = deque(maxlen=64)
+        self.prefetch_capacity_waiter_event_seq = 0
+        self.active_backup_operation = None
         # Buffer mode: wired by the tree cache after attach; the load rate
         # limiter subtracts write staging from actual pool usage.
         self.host_write_staged_tokens_fn: Optional[Callable[[], int]] = None
@@ -528,6 +540,7 @@ class HiCacheController:
                 [getattr(t, "name", repr(t)) for t in alive],
             )
             raise RuntimeError("Failed to stop HiCache storage threads cleanly.")
+        self.active_backup_operation = None
 
     def attach_storage_backend(
         self,
@@ -593,6 +606,10 @@ class HiCacheController:
                 self.prefetch_capacity_limit = int(0.5 * self.mem_pool_host.size)
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
+            self.prefetch_capacity_waiter_rids.clear()
+            self.prefetch_capacity_waiter_since.clear()
+            self.prefetch_capacity_waiter_events.clear()
+            self.prefetch_capacity_head_events.clear()
 
             # Use dedicated gloo groups so storage prefetch sync is isolated
             # from other collectives and consistent across CPxTP participants.
@@ -1134,6 +1151,11 @@ class HiCacheController:
                 # Check termination
                 if hit_pages != len(batch_hashes):
                     all_success = False
+                    if (
+                        not operation.is_terminated()
+                        and not operation.cache_observation.finalized
+                    ):
+                        operation.cache_observation.reason = "get_partial"
                 if prefix_keys is not None:
                     prefix_keys = prefix_keys + batch_hashes
                 completed_pages += hit_pages
@@ -1143,6 +1165,9 @@ class HiCacheController:
                 operation=operation,
             )
             self.prefetch_sync_queue.put(ack)
+        operation.cache_observation.tokens["completed_local"] = (
+            completed_pages * self.page_size
+        )
         return completed_pages
 
     def _page_transfer_kv_batch(
@@ -1195,9 +1220,14 @@ class HiCacheController:
                 continue
             if operation is None:
                 continue
+            obs = operation.cache_observation
+            obs.tokens.setdefault("allocated", len(operation.host_indices))
+            obs.mark("allocated")
+            obs.mark("get_start")
             try:
                 self._page_transfer(operation)
             finally:
+                operation.cache_observation.mark("get_done")
                 self.prefetch_sync_queue.put(
                     PrefetchAck(
                         rid=operation.request_id,
@@ -1206,10 +1236,10 @@ class HiCacheController:
                     )
                 )
 
-    def prefetch_rate_limited(self) -> bool:
-        """
-        Rate limit the prefetching operations to avoid overwhelming the storage backend.
-        """
+    def prefetch_rate_limited(
+        self, requested_tokens: int = 0, request_id: Optional[str] = None
+    ) -> bool:
+        """判断本次 L3 prefetch 是否应被容量门禁延后。"""
         if self.host_memory_mode == "buffer_only":
             # Gate on real pool usage: buffer mode allocates hit-sized, so
             # prefetch_tokens_occupied's requested spans overstate it. Pool
@@ -1220,11 +1250,112 @@ class HiCacheController:
             if self.host_write_staged_tokens_fn is not None:
                 used -= self.host_write_staged_tokens_fn()
             return max(0, used) >= self.prefetch_capacity_limit
-        # cancel prefetch if too much memory is occupied
-        if self.prefetch_tokens_occupied >= self.prefetch_capacity_limit:
+        # 开关关闭时完全保留旧行为：只在当前占用已经到达上限后拒绝，
+        # 不考虑本次 requested_tokens 是否会使总占用越界，也不记录 pending。
+        if not getattr(self, "prefetch_capacity_retry", False):
+            return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
+        # 保留历史上的无参数查询语义，避免其它调用方受新门禁影响。
+        if requested_tokens <= 0:
+            return self.prefetch_tokens_occupied >= self.prefetch_capacity_limit
+        waiter_rids = getattr(self, "prefetch_capacity_waiter_rids", [])
+        # 只要存在容量 pending，新请求就加入队尾；只有 FIFO 队首允许继续
+        # 做精确容量判断。因此后继请求不能越过 pending 启动新 prefetch。
+        if request_id is not None and waiter_rids:
+            if request_id not in waiter_rids:
+                previous_head = waiter_rids[0]
+                waiter_rids.append(request_id)
+                self._record_prefetch_capacity_waiter_event(
+                    "enqueue", request_id, previous_head
+                )
+            if request_id != waiter_rids[0]:
+                return True
+        # 精确门禁保证启动后 occupied 不会超过 limit。
+        if (
+            self.prefetch_tokens_occupied + requested_tokens
+            > self.prefetch_capacity_limit
+        ):
+            if request_id is not None and request_id not in waiter_rids:
+                previous_head = waiter_rids[0] if waiter_rids else None
+                waiter_rids.append(request_id)
+                self._record_prefetch_capacity_waiter_event(
+                    "enqueue", request_id, previous_head
+                )
             return True
         # todo: more sophisticated rate limiting based on storage backend performance
         return False
+
+    def prefetch_capacity_waiter_started(self, request_id: str) -> None:
+        """队首真正启动 prefetch 后出队，让下一位在后续调度轮次重试。"""
+        waiter_rids = self.prefetch_capacity_waiter_rids
+        if waiter_rids and waiter_rids[0] == request_id:
+            waiter_rids.pop(0)
+            self._record_prefetch_capacity_waiter_event("start", request_id, request_id)
+
+    def release_prefetch_capacity_waiter(self, request_id: str) -> None:
+        """请求无需再重试或已终止时，从容量 pending 队列中清理。"""
+        waiter_rids = self.prefetch_capacity_waiter_rids
+        if request_id in waiter_rids:
+            previous_head = waiter_rids[0]
+            waiter_rids.remove(request_id)
+            self._record_prefetch_capacity_waiter_event(
+                "release", request_id, previous_head
+            )
+
+    def _record_prefetch_capacity_waiter_event(
+        self, action: str, request_id: str, previous_head: Optional[str]
+    ) -> None:
+        now = time.monotonic()
+        since = getattr(self, "prefetch_capacity_waiter_since", None)
+        if since is None:
+            since = self.prefetch_capacity_waiter_since = {}
+        if action == "enqueue":
+            since[request_id] = now
+        else:
+            since.pop(request_id, None)
+        events = getattr(self, "prefetch_capacity_waiter_events", None)
+        if events is None:
+            events = self.prefetch_capacity_waiter_events = deque(maxlen=64)
+        head_events = getattr(self, "prefetch_capacity_head_events", None)
+        if head_events is None:
+            head_events = self.prefetch_capacity_head_events = deque(maxlen=64)
+        seq = getattr(self, "prefetch_capacity_waiter_event_seq", 0) + 1
+        self.prefetch_capacity_waiter_event_seq = seq
+        waiters = self.prefetch_capacity_waiter_rids
+        head = waiters[0] if waiters else None
+        event = dict(
+            seq=seq,
+            action=action,
+            rid=request_id,
+            previous_head_rid=previous_head,
+            head_rid=head,
+            waiter_count=len(waiters),
+            occupied_tokens=self.prefetch_tokens_occupied,
+        )
+        events.append(event)
+        if head != previous_head:
+            head_events.append(event)
+
+    def prefetch_capacity_waiter_snapshot(self) -> dict:
+        """Return bounded FIFO evidence for a rate-limited scheduler stall log."""
+        waiters = self.prefetch_capacity_waiter_rids
+        head = waiters[0] if waiters else None
+        since = getattr(self, "prefetch_capacity_waiter_since", {})
+        events = getattr(self, "prefetch_capacity_waiter_events", ())
+        head_events = getattr(self, "prefetch_capacity_head_events", ())
+        return dict(
+            head_rid=head,
+            head_wait_seconds=(
+                round(max(0.0, time.monotonic() - since[head]), 3)
+                if head in since
+                else None
+            ),
+            waiter_count=len(waiters),
+            occupied_tokens=self.prefetch_tokens_occupied,
+            capacity_limit=self.prefetch_capacity_limit,
+            event_seq=getattr(self, "prefetch_capacity_waiter_event_seq", 0),
+            recent_events=list(events)[-4:],
+            recent_head_events=list(head_events)[-8:],
+        )
 
     def alloc_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
@@ -1278,6 +1409,8 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                obs = operation.cache_observation
+                obs.mark("query_start")
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
@@ -1292,6 +1425,9 @@ class HiCacheController:
                     )
                     hash_value, storage_hit_count = [], 0
 
+                if not obs.finalized:
+                    obs.tokens["query_local"] = storage_hit_count
+                    obs.mark("query_done")
                 storage_hit_count = self._sync_prefetch_hit_query(
                     operation, storage_hit_count
                 )
@@ -1302,6 +1438,9 @@ class HiCacheController:
                     : (storage_hit_count // self.page_size)
                 ]
                 operation.storage_hit_count = storage_hit_count
+                if not obs.finalized:
+                    obs.tokens["query"] = storage_hit_count
+                    obs.mark("query_synced")
                 self.prefetch_hit_queue.put(operation)
 
             except Empty:
@@ -1388,9 +1527,15 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup_or_log(operation)
+                self.active_backup_operation = operation
+                operation.cache_observation.mark("get_start")
+                try:
+                    if not self.backup_skip:
+                        self._page_backup_or_log(operation)
+                finally:
+                    operation.cache_observation.mark("get_done")
                 self.ack_backup_queue.put(operation)
+                self.active_backup_operation = None
 
             except Empty:
                 continue

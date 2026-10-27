@@ -521,5 +521,12 @@ POSITIONAL_FIELD_ORDER = (
     "enable_decoder_swa_bounded_replay",
     "enable_response_store",
     "disaggregation_decode_host_receive_threshold",
+    "enable_dp_admission",
+    "dp_admission_max_queued_requests",
+    "dp_admission_queue_timeout",
+    "dp_admission_snapshot_timeout",
+    "hicache_storage_prefetch_cost_model",
+    "prefill_time_budget_ms",
+    "prefill_time_model",
 )
 # fmt: on

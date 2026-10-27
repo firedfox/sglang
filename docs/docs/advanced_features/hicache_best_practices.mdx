@@ -74,6 +74,64 @@ Guidelines:
 --hicache-storage-prefetch-policy timeout
 ```
 
+#### Cost-aware prefetch
+
+Use `--hicache-storage-prefetch-policy cost_aware` to compare the estimated
+remaining L3 read time with recomputation. The policy retains the existing
+timeout fallback and is opt-in. It requires the default UnifiedRadixCache with
+HiCache and radix caching enabled. PP with `buffer_only` host memory is rejected
+because that ticket path bypasses the admission stop policies.
+
+Supply calibration with `--hicache-storage-prefetch-cost-model`. For example,
+the following JSON demonstrates the schema; **the rates are illustrative,
+not calibrated deployment values**:
+
+```json
+{
+  "recompute_tokens_per_second": 20000,
+  "read_tokens_per_second": 100000,
+  "min_observation_seconds": 0.05,
+  "cancel_margin": 1.2,
+  "recompute_fixed_seconds": 0.0
+}
+```
+
+| Field | Requirement and default |
+| --- | --- |
+| `recompute_tokens_per_second` | Required, finite and positive. Calibrate for the model, context-length range, batch mix, and TP/CP layout. |
+| `read_tokens_per_second` | Optional positive finite initial estimate; defaults to `null`. Positive observed transfer progress takes precedence once the observation window is long enough. |
+| `min_observation_seconds` | Finite and nonnegative; default 0.05 seconds. |
+| `cancel_margin` | Finite and at least 1; default 1.2. Reading must exceed this multiple of recomputation cost before cost-based cancellation. |
+| `recompute_fixed_seconds` | Finite and nonnegative; default 0.0 seconds, added to the recomputation estimate. |
+
+Rates describe logical tokens for the complete cache group. Do not divide them
+by CP size again. The policy compares future read time against
+`recompute_fixed_seconds + unusable_tokens / recompute_tokens_per_second`;
+time already spent waiting is not added to either alternative. Unknown storage
+hits, missing calibration, zero progress without a configured read rate, or an
+otherwise unusable estimate retain timeout behavior. Selecting `cost_aware`
+without a cost model logs a warning and uses the timeout fallback.
+
+The implementation uses confirmed hits and rank-agreed progress. A refetch or
+prefix trim resets its progress sample, while the original request wait deadline
+continues. The stop decision uses the existing cross-rank consensus. Once made,
+it remains sticky through asynchronous cancellation and disables refetch retries.
+The first agreed reason stays stable: cost cancellation is reported as
+`cost_aware`, rather than a storage miss or a later timeout. The prefetch outcome
+snapshot includes `stopped_cost_aware` and `stopped_deadline` counters.
+
+For independent hybrid state pools, partial KV progress is not assumed to be a
+reusable prefix; the recomputation estimate conservatively covers the full hit
+span. When all main KV has arrived and only sidecar state remains, the policy
+keeps waiting instead of discarding that completed KV transfer. These rules
+preserve the existing storage cancellation and cleanup lifecycle.
+
+Keep `timeout` until you have calibration from the actual deployment. Compare
+L3 wait duration, useful cached tokens, recomputation, TTFT, and tail latency with
+the same request mix before adopting the cost policy. A single throughput rate
+does not capture every long-context workload, and enabling this policy alone
+does not establish a speedup.
+
 ### Integration with PD Disaggregation
 
 HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:

@@ -800,6 +800,12 @@ class Envs:
     # TODO(yangminl): remove SGLANG_STAGING_USE_TORCH and the torch fallback in
     # staging_buffer.py once Triton kernels are fully validated in production.
     SGLANG_STAGING_USE_TORCH = EnvBool(False)
+    SGLANG_HICACHE_PREFETCH_CAPACITY_RETRY = EnvBool(False)
+    SGLANG_HICACHE_OBSERVATION_LOG_SAMPLE_RATE = EnvFloat(0.01)
+    SGLANG_HICACHE_SLOW_BACKUP_SECONDS = EnvFloat(3.0)
+    SGLANG_HICACHE_SLOW_BACKUP_LOG_INTERVAL_SECONDS = EnvFloat(30.0)
+    SGLANG_PD_DECODE_ENABLE_CACHE_REPORT = EnvBool(False)
+    SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD = EnvInt(2)
     SGLANG_MOONCAKE_CUSTOM_MEM_POOL = EnvStr(None)
     # Opt-in limit for the number of KV cache indices represented by one
     # synchronous all-layer Mooncake batch. Set to a positive value to split

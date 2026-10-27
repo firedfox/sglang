@@ -50,6 +50,7 @@ from sglang.srt.entrypoints.openai.parallel_prompt_encode import (
     parallel_prompt_encode,
 )
 from sglang.srt.entrypoints.openai.protocol import (
+    BuiltinWebSearchTool,
     ChatCompletionMessageContentTextPart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageGenericParam,
@@ -75,7 +76,10 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     TopLogprob,
 )
-from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
+from sglang.srt.entrypoints.openai.serving_base import (
+    OpenAIServingBase,
+    StreamingAbortBeforeFirstChunk,
+)
 from sglang.srt.entrypoints.openai.sse_utils import build_sse_content
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor
 from sglang.srt.entrypoints.openai.utils import (
@@ -153,13 +157,23 @@ def normalize_tool_content(role: str, content):
 
 
 def parse_tool_call_arguments(arguments: str) -> dict[str, Any]:
-    """Parse OpenAI tool call arguments for chat templates."""
+    """Parse OpenAI tool call arguments for chat templates.
+
+    orjson 严格遵守 RFC 8259，不允许 JSON 字符串值中出现未转义的控制字符
+    (如 0x0A 换行符)。但部分客户端在构造嵌套 JSON body 时可能遗漏转义层，
+    导致 arguments 字符串中包含真实换行符。此处用 json.loads(strict=False)
+    兜底，允许控制字符以兼容这类客户端。
+    """
     try:
         parsed_arguments = orjson.loads(arguments)
-    except orjson.JSONDecodeError as exc:
-        raise ValueError(
-            "Assistant tool call function.arguments must be valid JSON."
-        ) from exc
+    except orjson.JSONDecodeError:
+        # orjson 严格模式失败，尝试 json.loads(strict=False) 允许控制字符
+        try:
+            parsed_arguments = json.loads(arguments, strict=False)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "Assistant tool call function.arguments must be valid JSON."
+            ) from exc
 
     if not isinstance(parsed_arguments, dict):
         raise ValueError(
@@ -492,8 +506,49 @@ class OpenAIServingChat(OpenAIServingBase):
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
 
+    @staticmethod
+    def _as_builtin_web_search_tool(
+        tool: Any,
+    ) -> Optional[BuiltinWebSearchTool]:
+        if isinstance(tool, BuiltinWebSearchTool):
+            return tool
+        if (
+            isinstance(tool, Tool)
+            and tool.function.name in {"web_search", "web_search_preview"}
+            and isinstance(tool.function.parameters, dict)
+            and tool.function.parameters.get("type") == tool.function.name
+        ):
+            return BuiltinWebSearchTool.model_validate(tool.function.parameters)
+        return None
+
+    @classmethod
+    def _get_function_tools(cls, request: ChatCompletionRequest) -> list[Tool]:
+        return [
+            tool
+            for tool in (request.tools or [])
+            if isinstance(tool, Tool) and cls._as_builtin_web_search_tool(tool) is None
+        ]
+
+    @classmethod
+    def _get_enabled_builtin_web_search_tools(
+        cls, request: ChatCompletionRequest
+    ) -> list[BuiltinWebSearchTool]:
+        builtin_tools = []
+        for tool in request.tools or []:
+            builtin_tool = cls._as_builtin_web_search_tool(tool)
+            if builtin_tool is not None and builtin_tool.is_enabled():
+                builtin_tools.append(builtin_tool)
+        return builtin_tools
+
+    @classmethod
+    def has_builtin_web_search_tools(cls, request: ChatCompletionRequest) -> bool:
+        return any(
+            cls._as_builtin_web_search_tool(tool) is not None
+            for tool in (request.tools or [])
+        )
+
     def _effective_tools(self, request: ChatCompletionRequest) -> list[Tool]:
-        tools = list(request.tools or [])
+        tools = self._get_function_tools(request)
         for message in request.messages:
             if (
                 isinstance(message, ChatCompletionMessageGenericParam)
@@ -670,12 +725,13 @@ class OpenAIServingChat(OpenAIServingBase):
                     ),
                 )
 
+            request_function_tools = self._get_function_tools(request)
             request_tools = (
                 [
                     tool.model_dump(exclude_unset=True, by_alias=True)
-                    for tool in request.tools
+                    for tool in request_function_tools
                 ]
-                if request.tools
+                if request_function_tools
                 else None
             )
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -1388,7 +1444,7 @@ class OpenAIServingChat(OpenAIServingBase):
             enable_thinking = (request.chat_template_kwargs or {}).get(
                 "enable_thinking"
             )
-            parser = FunctionCallParser(request.tools or [], self.tool_call_parser)
+            parser = FunctionCallParser(effective_tools, self.tool_call_parser)
             tool_call_constraint = parser.get_structure_constraint(
                 request.tool_choice,
                 parallel_tool_calls=request.parallel_tool_calls,
@@ -1406,11 +1462,11 @@ class OpenAIServingChat(OpenAIServingBase):
             if not isinstance(request.tool_choice, str):
                 tools = [
                     item.model_dump()
-                    for item in request.tools or []
+                    for item in effective_tools
                     if item.function.name == request.tool_choice.function.name
                 ] or None
-            elif request.tools:
-                tools = [item.model_dump() for item in request.tools]
+            elif effective_tools:
+                tools = [item.model_dump() for item in effective_tools]
             if self.tool_call_parser and not glm_constraint:
                 parser = FunctionCallParser(
                     effective_tools,
@@ -1601,7 +1657,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages, request
             )
 
-            request_tools = request.tools if tools else None
+            request_tools = self._get_function_tools(request) if tools else None
 
             # An empty system message hosts the request tools; dsv41 renders a
             # system token for it, so it only gets one when tools need the host.
@@ -1950,6 +2006,10 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        except StreamingAbortBeforeFirstChunk as e:
+            # Abort decided before HTTP 200 was committed (e.g. queue full):
+            # return a real HTTP error so the status code matches the body.
+            return self.create_error_response(e.message, e.err_type, e.status_code)
 
         async def prepend_first_chunk():
             yield first_chunk
@@ -2092,8 +2152,21 @@ class OpenAIServingChat(OpenAIServingBase):
                         finish_reason.get("status_code"), HTTPStatus
                     ):
                         code = finish_reason["status_code"]
+                        message = finish_reason.get("message", "Generation aborted.")
+                        # If the abort arrives before any chunk has been streamed
+                        # (e.g. admission-time rejections like "The request queue
+                        # is full."), HTTP 200 has not been committed yet: raise so
+                        # _handle_streaming_request can return a real HTTP error
+                        # whose status code matches the body. Once streaming has
+                        # started the 200 is on the wire, so an in-band SSE error
+                        # chunk is the only option (mirrors the ValueError handling
+                        # below).
+                        if not stream_started:
+                            raise StreamingAbortBeforeFirstChunk(
+                                message, code.name, code.value
+                            )
                         error = self.create_streaming_error_response(
-                            finish_reason.get("message", "Generation aborted."),
+                            message,
                             code.name,
                             code.value,
                         )
@@ -3159,26 +3232,22 @@ class OpenAIServingChat(OpenAIServingBase):
             # Mark that this choice has tool calls
             has_tool_calls[index] = True
 
-            # Tool call ID should be generated only once per tool call
+            # Only the first delta carries the tool call metadata.
             if call_item.name:
-                # First chunk: include ID and function name
-                tool_call_id = self._process_tool_call_id(
-                    call_item, history_tool_calls_cnt
+                tool_call = ToolCall(
+                    id=self._process_tool_call_id(call_item, history_tool_calls_cnt),
+                    index=call_item.tool_index,
+                    type="function",
+                    function=FunctionResponse(
+                        name=call_item.name,
+                        arguments=call_item.parameters,
+                    ),
                 )
-                function_name = call_item.name
             else:
-                # Subsequent chunks: null ID and name for argument deltas
-                tool_call_id = None
-                function_name = None
-
-            tool_call = ToolCall(
-                id=tool_call_id,
-                index=call_item.tool_index,
-                function=FunctionResponse(
-                    name=function_name,
-                    arguments=call_item.parameters,
-                ),
-            )
+                tool_call = ToolCall(
+                    index=call_item.tool_index,
+                    function=FunctionResponse(arguments=call_item.parameters),
+                )
 
             choice_data = ChatCompletionResponseStreamChoice(
                 index=index,
@@ -3188,6 +3257,7 @@ class OpenAIServingChat(OpenAIServingBase):
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
                 created=created,
+                object="chat.completion.chunk",
                 choices=[choice_data],
                 model=request.model,
             )
@@ -3204,7 +3274,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     cached_tokens=self._continuous_usage_cached_details(content),
                 )
 
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
     def _check_for_unstreamed_tool_args(
         self,
@@ -3258,10 +3328,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if remaining_call:
             # Create tool call chunk with remaining arguments
             tool_call = ToolCall(
-                id=None,  # No ID for argument deltas
                 index=tool_index,
                 function=FunctionResponse(
-                    name=None,  # No name for argument deltas
                     arguments=remaining_call,
                 ),
             )
@@ -3275,10 +3343,11 @@ class OpenAIServingChat(OpenAIServingBase):
             chunk = ChatCompletionStreamResponse(
                 id=content["meta_info"]["id"],
                 created=created,
+                object="chat.completion.chunk",
                 choices=[choice_data],
                 model=request.model,
             )
 
-            return f"data: {chunk.model_dump_json()}\n\n"
+            return f"data: {chunk.model_dump_json(exclude_unset=True)}\n\n"
 
         return None

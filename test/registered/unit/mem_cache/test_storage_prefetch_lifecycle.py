@@ -1,5 +1,7 @@
 """Staged L3 prefetch lifecycle through the buffer pipeline; no GPU kernels."""
 
+import json
+import logging
 import tempfile
 import unittest
 from array import array
@@ -7,7 +9,7 @@ from collections import defaultdict, deque
 from datetime import timedelta
 from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -20,10 +22,14 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import (
     BufferModePipeline,
     _StagedPrefetch,
 )
+from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+    StorageExistenceCache,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.prefetch_cost import PrefetchCostModel
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import (
@@ -61,6 +67,8 @@ def _staged_fixture(full_match=2):
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None
     cache.ongoing_prefetch = {}
+    cache._storage_prefetch_wait = {}
+    cache._prefetch_cost_diagnostics = {}
     cache._prefetch_outcome_stats = defaultdict(int)
     cache.tree_components = []
     cache.components = {}
@@ -147,6 +155,8 @@ def _hit_drain_fixture():
         extra_host_mem_release_queues={},
     )
     cache.ongoing_prefetch = {}
+    cache._storage_prefetch_wait = {}
+    cache._prefetch_cost_diagnostics = {}
     return cache
 
 
@@ -156,6 +166,7 @@ def _terminated_query(cache, rid, hit_tokens):
         request_id=rid,
         handle=handle,
         storage_hit_count=hit_tokens,
+        deadline_expired=False,
         stats_requested_tokens=8,
         is_terminated=lambda: True,
     )
@@ -163,6 +174,429 @@ def _terminated_query(cache, rid, hit_tokens):
         0, RadixKey(array("q", range(8))), None, operation, None, {}
     )
     cache.cache_controller.prefetch_hit_queue.put(operation)
+
+
+def _timeout_fixture(mode="buffer_only", policy="timeout"):
+    cache, pipeline, req = _staged_fixture()
+    pipeline.staged_prefetches.clear()
+    cache.host_memory_mode = mode
+    if mode == "cache":
+        cache.buffer_pipeline = None
+    cache.prefetch_stop_policy = policy
+    cache.prefetch_timeout_base = 1.0
+    cache.prefetch_timeout_per_page = 0.25
+    cache.prefetch_cost_model = None
+    cache.pp_rank = 0
+    cache._all_reduce = lambda tensor, op: None
+    cache.inc_host_lock_ref = Mock()
+    cache.dec_host_lock_ref = Mock()
+    cache.cache_controller.pp_prefetch_decisions = {}
+    cache.cache_controller.prefetch_tokens_occupied = 0
+    cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+    return cache, cache.ongoing_prefetch[_REQ].operation
+
+
+def _cost_fixture():
+    cache, operation = _timeout_fixture(policy="cost_aware")
+    cache.prefetch_cost_model = PrefetchCostModel(
+        recompute_tokens_per_second=100,
+        read_tokens_per_second=1,
+    )
+    cache.storage_existence_cache = StorageExistenceCache()
+    operation.storage_hit_count = 8
+    operation.hash_value = ["a", "b", "c", "d"]
+    operation.host_indices = torch.arange(8)
+    operation.buffer_host_occupied_units = 8
+    cache.ongoing_prefetch[_REQ] = cache.ongoing_prefetch[_REQ]._replace(
+        host_indices=operation.host_indices
+    )
+    cache.buffer_pipeline.set_prefix_ctx(_REQ, [])
+    cc = cache.cache_controller
+    cc.prefetch_tokens_occupied = 8
+    cc.mem_pool_host.page_size = 2
+    cc.mem_pool_host.entry_map[PoolName.SWA].is_primary_index_anchor = False
+    cc.mem_pool_host.entry_map[PoolName.SWA].host_pool.page_size = 2
+    cc.host_mem_release_queue = Queue()
+    cc.extra_host_mem_release_queues = {PoolName.SWA: Queue()}
+    return cache, operation
+
+
+def _two_rank_prefetch_deadline(rank, rendezvous):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        cache, operation = _timeout_fixture()
+        cache._all_reduce = torch.distributed.all_reduce
+        # Only one rank has reached admission; its expiry must close both budgets.
+        if rank == 0:
+            with patch("time.perf_counter", return_value=100.0):
+                cache._start_storage_prefetch_wait(operation)
+        with patch("time.perf_counter", return_value=103.0):
+            assert cache.check_prefetch_progress(_REQ)
+        assert operation.deadline_expired
+        assert cache._storage_prefetch_wait[_REQ].expired
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        assert not cache.ongoing_prefetch
+        assert not cache.storage_prefetch_retries._pending
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def _two_rank_prefetch_cost(rank, rendezvous):
+    torch.distributed.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        for deadline_on_peer in (False, True):
+            cache, operation = _cost_fixture()
+            cache._all_reduce = torch.distributed.all_reduce
+            if rank == 0 or deadline_on_peer:
+                started_at = 100.0 if rank == 0 else 90.0
+                with patch("time.perf_counter", return_value=started_at):
+                    cache._start_storage_prefetch_wait(operation)
+            with patch("time.perf_counter", return_value=100.5):
+                assert cache.check_prefetch_progress(_REQ)
+            expected = "deadline" if deadline_on_peer else "cost_aware"
+            wait = cache._storage_prefetch_wait[_REQ]
+            assert wait.expired and wait.stop_reason == expected
+            assert operation.deadline_expired and operation.is_terminated()
+            assert cache._prefetch_outcome_stats[f"stopped_{expected}"] == 1
+            cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+            assert not cache.ongoing_prefetch
+            assert not cache.storage_prefetch_retries._pending
+            assert cache.cache_controller.prefetch_tokens_occupied == 0
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+class TestStoragePrefetchTimeout(unittest.TestCase):
+    def test_expiry_is_agreed_even_before_a_peer_starts_waiting(self):
+        """A rank that has not reached its admission poll must still adopt
+        the agreed expiry, or it would re-issue the prefetch alone."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch.multiprocessing.spawn(
+                _two_rank_prefetch_deadline,
+                args=(f"{tmpdir}/gloo",),
+                nprocs=2,
+            )
+
+
+class TestStoragePrefetchCostAware(unittest.TestCase):
+    def test_repeated_stop_poll_preserves_first_reason_until_cancel_drains(self):
+        cache, operation = _cost_fixture()
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        with patch("time.perf_counter", return_value=100.5):
+            self.assertTrue(cache._can_terminate_prefetch(operation))
+            cache._mark_prefetch_deadline_expired(operation)
+        # The stop was agreed but the operation/cancellation ACK is still pending.
+        with patch("time.perf_counter", return_value=110.0):
+            self.assertTrue(cache._can_terminate_prefetch(operation))
+            cache._mark_prefetch_deadline_expired(operation)
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        self.assertEqual(cache._storage_prefetch_wait[_REQ].stop_reason, "cost_aware")
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_deadline"], 0)
+
+    def test_partial_prefix_is_salvaged_and_retry_cannot_restart_the_wait(self):
+        cache, operation = _cost_fixture()
+        cache.storage_existence_cache.pool(PoolName.KV).add(operation.hash_value)
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
+        cache._storage_prefetch_hit_remaining_by_reqid[_REQ] = 8
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        operation.completed_tokens = 2
+        cache.storage_prefetch_retries.refetch(_REQ.rid, 8)
+        with patch("time.perf_counter", return_value=100.5):
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        self.assertEqual(cache.buffer_pipeline.staged_prefetches[_REQ].num_tokens, 2)
+        self.assertTrue(operation.deadline_expired)
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+        cache.storage_metrics_collector.log_storage_prefetch_unfulfilled_tokens.assert_called_once_with(
+            6, "cost_aware"
+        )
+        # Cancellation does not claim the untransferred suffix is absent in L3.
+        for page in operation.hash_value:
+            self.assertTrue(
+                cache.storage_existence_cache.pool(PoolName.KV).contains(page)
+            )
+        self.assertFalse(cache.storage_prefetch_retries._pending)
+        cache.buffer_pipeline.release_staged_hold(_REQ)
+        cache.prefetch_from_storage(_REQ, 0, list(range(8)))
+        self.assertFalse(cache.ongoing_prefetch)
+        self.assertTrue(cache.check_prefetch_progress(_REQ))
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+
+    def test_fast_progress_keeps_waiting(self):
+        cache, operation = _cost_fixture()
+        cache.prefetch_cost_model = PrefetchCostModel(
+            recompute_tokens_per_second=1, read_tokens_per_second=0.01
+        )
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        operation.completed_tokens = 2
+        with patch("time.perf_counter", return_value=100.5):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        self.assertFalse(operation.is_terminated())
+        self.assertFalse(cache._storage_prefetch_wait[_REQ].expired)
+
+    def test_missing_model_progress_or_query_falls_back_to_deadline(self):
+        for scenario in ("model", "progress", "query"):
+            with self.subTest(scenario=scenario):
+                cache, operation = _cost_fixture()
+                if scenario == "model":
+                    cache.prefetch_cost_model = None
+                elif scenario == "progress":
+                    cache.prefetch_cost_model = PrefetchCostModel(
+                        recompute_tokens_per_second=100
+                    )
+                else:
+                    operation.hash_value = []
+                    operation.host_indices = None
+                    cache.ongoing_prefetch[_REQ] = cache.ongoing_prefetch[
+                        _REQ
+                    ]._replace(host_indices=None)
+                    cache.cache_controller.prefetch_tokens_occupied = 0
+                with patch("time.perf_counter", return_value=100.0):
+                    self.assertFalse(cache.check_prefetch_progress(_REQ))
+                with patch("time.perf_counter", return_value=100.5):
+                    self.assertFalse(cache.check_prefetch_progress(_REQ))
+                with patch("time.perf_counter", return_value=103.0):
+                    self.assertTrue(cache.check_prefetch_progress(_REQ))
+                self.assertEqual(
+                    cache._storage_prefetch_wait[_REQ].stop_reason, "deadline"
+                )
+                self.assertEqual(cache._prefetch_outcome_stats["stopped_deadline"], 1)
+                self.assertTrue(operation.deadline_expired)
+
+    def test_pending_sidecar_after_all_kv_lands_is_not_cancelled(self):
+        cache, operation = _cost_fixture()
+        operation.completed_tokens = 8
+        operation.pool_transfers = [PoolTransfer(name=PoolName.SWA, keys=["tail"])]
+        operation.pool_transfers_done = False
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        with patch("time.perf_counter", return_value=110.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        self.assertFalse(operation.is_terminated())
+
+    def test_hybrid_cancel_preserves_beliefs_and_releases_only_owned_rows(self):
+        cache, operation = _cost_fixture()
+        cache.storage_existence_cache.pool(PoolName.KV).add(operation.hash_value)
+        cache.storage_existence_cache.pool(PoolName.SWA).add(["tail"])
+        operation.pool_transfers = [
+            PoolTransfer(name=PoolName.SWA, keys=["tail"], host_indices=torch.arange(4))
+        ]
+        operation.pool_transfers_done = False
+        with patch("time.perf_counter", return_value=100.0):
+            self.assertFalse(cache.check_prefetch_progress(_REQ))
+        operation.completed_tokens = 2
+        with patch("time.perf_counter", return_value=100.5):
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        self.assertFalse(cache.ongoing_prefetch)
+        self.assertFalse(cache.buffer_pipeline.staged_prefetches)
+        self.assertEqual(cache.prefetch_loaded_tokens_by_reqid[_REQ], 0)
+        self.assertTrue(cache.storage_existence_cache.pool(PoolName.KV).contains("d"))
+        self.assertTrue(
+            cache.storage_existence_cache.pool(PoolName.SWA).contains("tail")
+        )
+        cc = cache.cache_controller
+        self.assertEqual(cc.prefetch_tokens_occupied, 0)
+        self.assertEqual(cc.host_mem_release_queue.qsize(), 1)
+        self.assertEqual(cc.host_mem_release_queue.get().tolist(), [0, 1])
+        # The transfer worker still owns the unfinished KV/sidecar tail.
+        self.assertTrue(cc.extra_host_mem_release_queues[PoolName.SWA].empty())
+
+    def test_hybrid_recompute_includes_trimmed_full_head_without_joint_state(self):
+        cache, operation = _cost_fixture()
+        cache.prefetch_cost_model = PrefetchCostModel(
+            recompute_tokens_per_second=40, read_tokens_per_second=10
+        )
+        operation.sidecar_hash_values = operation.hash_value[:]
+        operation.hash_value = operation.hash_value[2:]
+        operation.storage_start = 4
+        operation.completed_tokens = 2
+        operation.pool_transfers = [PoolTransfer(name=PoolName.SWA, keys=["tail"])]
+        with patch("time.perf_counter", return_value=100.0):
+            cache._start_storage_prefetch_wait(operation)
+        with patch("time.perf_counter", return_value=100.5):
+            # Remaining read = .2s; recomputing the untrimmed joint prefix = .2s.
+            self.assertFalse(cache._prefetch_cost_exceeds_recompute(operation))
+            operation.sidecar_hash_values = None
+            # Without the missing-state head the recompute alternative is .1s.
+            self.assertTrue(cache._prefetch_cost_exceeds_recompute(operation))
+
+    def test_new_operation_and_span_reset_sample_but_not_total_deadline(self):
+        cache, operation = _cost_fixture()
+        with patch("time.perf_counter", return_value=100.0):
+            cache._start_storage_prefetch_wait(operation)
+        wait = cache._storage_prefetch_wait[_REQ]
+        for time_now, change in ((100.5, "refetch"), (101.0, "trim")):
+            if change == "refetch":
+                operation.id += 1
+                operation.completed_tokens = 2
+            else:
+                operation.storage_start = 2
+                operation.hash_value.pop(0)
+                operation.completed_tokens = 0
+            with patch("time.perf_counter", return_value=time_now):
+                self.assertFalse(cache._prefetch_cost_exceeds_recompute(operation))
+            self.assertEqual(wait.progress_timer.started_at, time_now)
+            self.assertEqual(wait.progress_start_tokens, operation.completed_tokens)
+            self.assertEqual(wait.timer.started_at, 100.0)
+        with patch("time.perf_counter", return_value=103.0):
+            self.assertTrue(cache._prefetch_deadline_expired(operation))
+
+    def test_existing_policies_do_not_use_cost_model(self):
+        for policy, expected in (
+            ("best_effort", True),
+            ("wait_complete", False),
+            ("timeout", False),
+        ):
+            with self.subTest(policy=policy):
+                cache, operation = _cost_fixture()
+                cache.prefetch_stop_policy = policy
+                with patch.object(
+                    cache, "_prefetch_cost_exceeds_recompute"
+                ) as evaluate:
+                    self.assertEqual(cache._can_terminate_prefetch(operation), expected)
+                evaluate.assert_not_called()
+
+    def test_cost_stop_and_deadline_reason_are_agreed_across_ranks(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            torch.multiprocessing.spawn(
+                _two_rank_prefetch_cost,
+                args=(f"{tmpdir}/gloo",),
+                nprocs=2,
+            )
+
+
+class TestStoragePrefetchCostDiagnostics(unittest.TestCase):
+    logger_name = "sglang.srt.mem_cache.unified_radix_cache"
+    marker = "HiCache prefetch cost decision "
+
+    def decisions(self, captured):
+        return [
+            json.loads(record.getMessage().split(self.marker, 1)[1])
+            for record in captured.records
+            if self.marker in record.getMessage()
+        ]
+
+    def test_stop_drain_logs_one_terminal_snapshot_with_original_vote(self):
+        cache, operation = _cost_fixture()
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            with patch("time.perf_counter", return_value=100.0):
+                self.assertFalse(cache.check_prefetch_progress(_REQ))
+            operation.completed_tokens = 2
+            with patch("time.perf_counter", return_value=100.5):
+                self.assertTrue(cache._can_terminate_prefetch(operation))
+                cache._mark_prefetch_deadline_expired(operation)
+            with patch("time.perf_counter", return_value=110.0):
+                self.assertTrue(cache._can_terminate_prefetch(operation))
+                cache._mark_prefetch_deadline_expired(operation)
+                self.assertTrue(cache.check_prefetch_progress(_REQ))
+                self.assertTrue(cache.check_prefetch_progress(_REQ))
+        decisions = self.decisions(captured)
+        self.assertEqual(len(decisions), 1)
+        decision = decisions[0]
+        self.assertEqual(decision["terminal"], "buffer_stage")
+        self.assertEqual(decision["local_vote"], "cost_aware")
+        self.assertEqual(decision["agreed_stop_reason"], "cost_aware")
+        self.assertIsNone(decision["fallback_reason"])
+        self.assertEqual(decision["last_evaluation"]["read_rate_source"], "observed")
+        self.assertEqual(decision["last_evaluation"]["read_tokens_per_second"], 4)
+        self.assertEqual(decision["last_evaluation"]["remaining_tokens"], 6)
+        self.assertEqual(decision["last_evaluation"]["recompute_tokens"], 6)
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+        self.assertEqual(cache._prefetch_cost_diagnostics, {})
+
+    def test_peer_stop_does_not_relabel_the_local_keep_vote(self):
+        cache, operation = _cost_fixture()
+        cache._all_reduce = Mock(side_effect=lambda tensor, op: tensor.fill_(1))
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["local_vote"], "keep_waiting")
+        self.assertEqual(decision["agreed_stop_reason"], "cost_aware")
+        self.assertEqual(decision["fallback_reason"], "wait_not_started")
+        self.assertIsNone(decision["last_evaluation"])
+        # Observability must not introduce another rank collective.
+        cache._all_reduce.assert_called_once()
+        self.assertEqual(cache._prefetch_outcome_stats["stopped_cost_aware"], 1)
+
+    def test_completed_before_first_poll_is_not_reported_as_a_cost_keep(self):
+        cache, operation = _cost_fixture()
+        operation.completed_tokens = 8
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            cache._handle_prefetch_result(operation)
+            self.assertTrue(cache.check_prefetch_progress(_REQ))
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["last_poll_reason"], "not_evaluated")
+        self.assertEqual(decision["fallback_reason"], "not_evaluated")
+        self.assertIsNone(decision["last_evaluation"])
+        self.assertIsNone(decision["agreed_stop_reason"])
+
+    def test_deadline_retains_the_reason_cost_estimation_was_unavailable(self):
+        cache, operation = _cost_fixture()
+        operation.hash_value = []
+        operation.host_indices = None
+        cache.ongoing_prefetch[_REQ] = cache.ongoing_prefetch[_REQ]._replace(
+            host_indices=None
+        )
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            for now in (100.0, 100.5):
+                with patch("time.perf_counter", return_value=now):
+                    self.assertFalse(cache.check_prefetch_progress(_REQ))
+            with patch("time.perf_counter", return_value=103.0):
+                self.assertTrue(cache.check_prefetch_progress(_REQ))
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["agreed_stop_reason"], "deadline")
+        self.assertEqual(decision["fallback_reason"], "query_pending")
+        self.assertEqual(decision["unfulfilled_reason"], "deadline")
+        self.assertEqual(cache._prefetch_cost_diagnostics, {})
+
+    def test_abort_logs_last_keep_once_and_releases_diagnostic_state(self):
+        cache, operation = _cost_fixture()
+        cache.prefetch_cost_model = PrefetchCostModel(
+            recompute_tokens_per_second=1, read_tokens_per_second=1
+        )
+        with self.assertLogs(self.logger_name, level="DEBUG") as captured:
+            with patch("time.perf_counter", return_value=100.0):
+                self.assertFalse(cache.check_prefetch_progress(_REQ))
+            operation.completed_tokens = 2
+            with patch("time.perf_counter", return_value=100.5):
+                self.assertFalse(cache.check_prefetch_progress(_REQ))
+            cache.release_aborted_request(_REQ)
+            cache.release_aborted_request(_REQ)
+        (decision,) = self.decisions(captured)
+        self.assertEqual(decision["terminal"], "retired")
+        self.assertEqual(decision["unfulfilled_reason"], "request_aborted")
+        self.assertEqual(decision["last_evaluation"]["decision"], "keep")
+        self.assertEqual(cache._prefetch_cost_diagnostics, {})
+
+    def test_default_log_level_does_not_build_diagnostics(self):
+        cache, operation = _cost_fixture()
+        log = logging.getLogger(self.logger_name)
+        with (
+            patch.object(log, "isEnabledFor", return_value=False),
+            patch.object(PrefetchCostModel, "describe_estimate") as describe,
+        ):
+            with patch("time.perf_counter", return_value=100.0):
+                cache.check_prefetch_progress(_REQ)
+            with patch("time.perf_counter", return_value=100.5):
+                cache.check_prefetch_progress(_REQ)
+        describe.assert_not_called()
+        self.assertFalse(getattr(cache, "_prefetch_cost_diagnostics", {}))
 
 
 def _two_rank_retry_trace(rank, rendezvous):
@@ -563,6 +997,7 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
             request_id="unservable",
             handle=handle,
             storage_hit_count=6,
+            deadline_expired=False,
             stats_requested_tokens=8,
             is_terminated=lambda: False,
             all_hash_values=None,

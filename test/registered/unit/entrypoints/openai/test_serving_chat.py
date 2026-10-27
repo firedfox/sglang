@@ -2993,7 +2993,7 @@ class ServingChatTestCase(CustomTestCase):
             OpenAIServingChat(tm, TemplateManager())
 
     def test_streaming_abort_yields_error(self):
-        """Test that an abort finish reason during streaming correctly yields an error and stops."""
+        """An abort before the first chunk returns its HTTP status before SSE starts."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
@@ -3041,39 +3041,19 @@ class ServingChatTestCase(CustomTestCase):
                 req, self.fastapi_request
             )
 
-            async def run_stream():
-                chunks = []
-                try:
-                    async for chunk in self.chat._generate_chat_stream(
-                        adapted_request, req, self.fastapi_request
-                    ):
-                        chunks.append(chunk)
-                except Exception as e:
-                    print(f"Error during stream iteration: {e}")
-                return chunks
-
-        loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
-
-        error_chunk_data = None
-        for c in chunks:
-            if "error" in c:
-                error_chunk_data = json.loads(c[len("data: ") :])
-                break
-        self.assertIsNotNone(error_chunk_data, "Error chunk not found in stream")
-        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
-
-        # Ensure the stream stops after the abort error
-        # The last chunk should be "data: [DONE]\n\n"
-        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
-
-        # Check that there is an error chunk and a DONE chunk
-        self.assertEqual(len(chunks), 2)
-        self.assertIn("error", chunks[0])
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
+        )
+        self.assertEqual(response.status_code, err_code.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["code"], err_code.value)
+        self.assertNotIn("body_iterator", vars(response))
 
     def test_streaming_abort_with_ids_enabled(self):
-        """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
+        """An abort before any chunk cannot leak sglext ids or an HTTP 200."""
         err_msg = "Aborted by scheduler"
         err_code = HTTPStatus.INTERNAL_SERVER_ERROR
 
@@ -3121,31 +3101,16 @@ class ServingChatTestCase(CustomTestCase):
                 req, self.fastapi_request
             )
 
-            async def run_stream():
-                chunks = []
-                try:
-                    async for chunk in self.chat._generate_chat_stream(
-                        adapted_request, req, self.fastapi_request
-                    ):
-                        chunks.append(chunk)
-                except Exception as e:
-                    print(f"Error during stream iteration: {e}")
-                return chunks
-
-        loop = get_or_create_event_loop()
-        chunks = loop.run_until_complete(run_stream())
-
-        # Exactly one error chunk followed by [DONE]; no sglext ids leak.
-        self.assertIn("error", chunks[0])
-        self.assertEqual(chunks[1], "data: [DONE]\n\n")
-        self.assertFalse(
-            any("input_ids" in c or "output_ids" in c for c in chunks),
-            "sglext ids event leaked after abort error",
+        response = get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, req, self.fastapi_request
+            )
         )
-
-        error_chunk_data = json.loads(chunks[0][len("data: ") :])
-        self.assertEqual(error_chunk_data["error"]["message"], err_msg)
-        self.assertEqual(error_chunk_data["error"]["code"], err_code.value)
+        self.assertEqual(response.status_code, err_code.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["code"], err_code.value)
+        self.assertNotIn("body_iterator", vars(response))
 
     def test_streaming_error_abort_still_finalizes_other_choices(self):
         """An error abort ends generation but still runs finalization, so a

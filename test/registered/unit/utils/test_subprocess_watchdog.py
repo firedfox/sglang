@@ -45,6 +45,11 @@ def noop_worker():
     pass
 
 
+def signaled_worker(connection, exit_code):
+    connection.recv()
+    os._exit(exit_code)
+
+
 class TestSubprocessWatchdog(CustomTestCase):
     def setUp(self):
         self.sigquit_triggered = threading.Event()
@@ -123,6 +128,69 @@ class TestSubprocessWatchdog(CustomTestCase):
         self._watch([], interval=0.1)
         time.sleep(0.3)
         self.assertFalse(self.sigquit_triggered.is_set())
+
+    def test_process_metric_tracks_real_normal_and_abnormal_exit(self):
+        from prometheus_client import CollectorRegistry, Gauge
+
+        for exit_code in (0, 42):
+            with self.subTest(exit_code=exit_code):
+                self.sigquit_triggered.clear()
+                registry = CollectorRegistry()
+                gauge = Gauge(
+                    "test_scheduler_process_up",
+                    "Liveness",
+                    ["model_name", "engine_type", "process_name"],
+                    registry=registry,
+                )
+                parent, child = mp.Pipe()
+                self.addCleanup(parent.close)
+                self.addCleanup(child.close)
+                proc = self._spawn(signaled_worker, (child, exit_code))
+                with unittest.mock.patch(
+                    "sglang.srt.utils.watchdog._get_scheduler_process_up_gauge",
+                    return_value=gauge,
+                ):
+                    monitor = SubprocessWatchdog(
+                        [proc],
+                        ["scheduler_1"],
+                        interval=60,
+                        metrics_labels={"model_name": "glm53", "engine_type": "decode"},
+                    )
+                self.addCleanup(monitor.stop)
+                monitor.start()
+                labels = {
+                    "model_name": "glm53",
+                    "engine_type": "decode",
+                    "process_name": "scheduler_1",
+                }
+                self.assertEqual(
+                    registry.get_sample_value("test_scheduler_process_up", labels), 1
+                )
+                parent.send(True)
+                proc.join(timeout=5)
+                self.assertFalse(proc.is_alive())
+                self.assertEqual(monitor._check_processes(), exit_code != 0)
+                self.assertEqual(
+                    registry.get_sample_value("test_scheduler_process_up", labels), 0
+                )
+                self.assertEqual(self.sigquit_triggered.is_set(), exit_code != 0)
+
+    def test_non_scheduler_is_excluded_from_metrics(self):
+        gauge = unittest.mock.Mock()
+        proc = unittest.mock.Mock()
+        with unittest.mock.patch(
+            "sglang.srt.utils.watchdog._get_scheduler_process_up_gauge",
+            return_value=gauge,
+        ):
+            monitor = SubprocessWatchdog(
+                [proc],
+                ["controller"],
+                metrics_labels={"model_name": "glm53", "engine_type": "decode"},
+                metrics_process_names=set(),
+            )
+        monitor._set_process_up(proc, "controller")
+        gauge.labels.assert_not_called()
+        proc.is_alive.assert_not_called()
 
     def test_normal_exit_no_sigquit(self):
         proc = self._spawn(noop_worker)

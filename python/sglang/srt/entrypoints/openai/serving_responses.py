@@ -43,6 +43,7 @@ from openai.types.responses.response_reasoning_summary_part_done_event import (
     Part as ResponseReasoningSummaryDonePart,
 )
 from openai_harmony import Message as OpenAIMessage
+from openai_harmony import Role as OpenAIRole
 
 from sglang.srt.entrypoints.context import (
     ConversationContext,
@@ -71,6 +72,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ResponsesRequest,
     ResponsesResponse,
     Tool,
+    ToolChoice,
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.responses_adapters import (
@@ -102,6 +104,17 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+_CHAT_WEB_SEARCH_INJECTION_TEMPLATE = """Fresh web search results are available for this request.
+Use them as the primary up-to-date source when they are relevant.
+If the search results are insufficient or irrelevant, say so instead of inventing facts.
+
+<web_search>
+<query>{query}</query>
+<results>
+{results}
+</results>
+</web_search>"""
 
 
 class _MediaInputValidationError(ValueError):
@@ -164,10 +177,15 @@ class OpenAIServingResponses(OpenAIServingChat):
         tokenizer_manager: TokenizerManager,
         template_manager: TemplateManager,
         *,
+        chat_serving: Optional[OpenAIServingChat] = None,
         enable_prompt_tokens_details: bool = False,
         tool_server: Optional[ToolServer] = None,
     ) -> None:
         super().__init__(tokenizer_manager, template_manager)
+        # Chat-compatible web search must execute on a real Chat handler. Calling
+        # the inherited methods on this Responses instance would dynamically
+        # dispatch to Responses-specific request IDs and error serializers.
+        self.chat_serving = chat_serving
 
         # template_manager is already set by parent class; reasoning_parser comes
         # from the parent, which reads the manager's control-plane overlay.
@@ -212,6 +230,191 @@ class OpenAIServingResponses(OpenAIServingChat):
         self.background_tasks: dict[str, asyncio.Task] = {}
         self.enable_response_store = get_serving().enable_response_store
         self.is_disaggregated = get_disagg().disaggregation_mode != "null"
+
+    @staticmethod
+    def _extract_chat_message_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content.strip()
+        if not isinstance(content, list):
+            return ""
+        chunks = []
+        for part in content:
+            text = getattr(part, "text", None)
+            if text is None and isinstance(part, dict):
+                text = part.get("text")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text.strip())
+        return "\n".join(chunks)
+
+    @classmethod
+    def _extract_latest_user_query(
+        cls, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        for message in reversed(request.messages):
+            if getattr(message, "role", None) == "user":
+                query = cls._extract_chat_message_text(message.content)
+                if query:
+                    return query
+        return None
+
+    @staticmethod
+    def _without_builtin_web_search(
+        request: ChatCompletionRequest,
+    ) -> ChatCompletionRequest:
+        function_tools = OpenAIServingChat._get_function_tools(request)
+        return request.model_copy(
+            update={
+                "tools": function_tools or None,
+                "tool_choice": OpenAIServingResponses._function_tool_choice(
+                    request.tool_choice, function_tools
+                ),
+            }
+        )
+
+    @staticmethod
+    def _function_tool_choice(
+        tool_choice: Union[ToolChoice, str], function_tools: list[Tool]
+    ) -> Union[ToolChoice, str]:
+        if not function_tools:
+            return "none"
+        if isinstance(tool_choice, ToolChoice):
+            function_names = {tool.function.name for tool in function_tools}
+            if tool_choice.function.name not in function_names:
+                # A named builtin choice has already been consumed by the
+                # search prefetch and must not constrain the remaining tools.
+                return "auto"
+        return tool_choice
+
+    @staticmethod
+    def _requires_builtin_web_search(request: ChatCompletionRequest) -> bool:
+        if request.tool_choice == "required":
+            return True
+        if not isinstance(request.tool_choice, ToolChoice):
+            return False
+        selected_name = request.tool_choice.function.name
+        return any(
+            builtin.type == selected_name
+            for builtin in OpenAIServingChat._get_enabled_builtin_web_search_tools(
+                request
+            )
+        )
+
+    async def _run_builtin_web_search_query(self, query: str) -> str:
+        if not self.supports_browsing or self.tool_server is None:
+            raise RuntimeError("builtin web_search backend is not enabled")
+
+        async with AsyncExitStack() as exit_stack:
+            browser = await exit_stack.enter_async_context(
+                self.tool_server.get_tool_session("browser")
+            )
+            from sglang.srt.entrypoints.tool import HarmonyBrowserTool
+
+            if isinstance(browser, HarmonyBrowserTool):
+                return await browser.search(query)
+
+            search_call = (
+                OpenAIMessage.from_role_and_content(
+                    OpenAIRole.ASSISTANT,
+                    json.dumps({"query": query}, ensure_ascii=False),
+                )
+                .with_channel("commentary")
+                .with_recipient("browser.search")
+                .with_content_type("json")
+            )
+            output_messages = await HarmonyContext(
+                [search_call], {"browser": browser}
+            ).call_tool()
+
+        chunks = [
+            content.text.strip()
+            for message in output_messages
+            for content in (getattr(message, "content", None) or [])
+            if isinstance(getattr(content, "text", None), str) and content.text.strip()
+        ]
+        if not chunks:
+            raise RuntimeError("builtin web_search returned no textual content")
+        return "\n\n".join(chunks)
+
+    @staticmethod
+    def _inject_builtin_web_search_results(
+        request: ChatCompletionRequest, query: str, results: str
+    ) -> ChatCompletionRequest:
+        messages = [
+            message.model_dump(exclude_none=True) for message in request.messages
+        ]
+        insert_at = 0
+        while insert_at < len(messages) and messages[insert_at].get("role") in {
+            "system",
+            "developer",
+        }:
+            insert_at += 1
+        messages.insert(
+            insert_at,
+            {
+                "role": "system",
+                "content": _CHAT_WEB_SEARCH_INJECTION_TEMPLATE.format(
+                    query=query, results=results
+                ),
+            },
+        )
+        function_tools = OpenAIServingChat._get_function_tools(request)
+        payload = request.model_dump()
+        payload.update(
+            messages=messages,
+            tools=[tool.model_dump() for tool in function_tools] or None,
+            tool_choice=OpenAIServingResponses._function_tool_choice(
+                request.tool_choice, function_tools
+            ),
+        )
+        return ChatCompletionRequest.model_validate(payload)
+
+    async def handle_chat_completions_compatible_request(
+        self, request: ChatCompletionRequest, raw_request: Request
+    ) -> Any:
+        """Serve Tencent builtin web_search while preserving Chat API output."""
+        if self.chat_serving is None:
+            self.chat_serving = OpenAIServingChat(
+                self.tokenizer_manager, self.template_manager
+            )
+        if not self.has_builtin_web_search_tools(request):
+            return await self.chat_serving.handle_request(request, raw_request)
+
+        plain_request = self._without_builtin_web_search(request)
+        if (
+            request.tool_choice == "none"
+            or not self._get_enabled_builtin_web_search_tools(request)
+        ):
+            return await self.chat_serving.handle_request(plain_request, raw_request)
+
+        query = self._extract_latest_user_query(request)
+        if not query:
+            if self._requires_builtin_web_search(request):
+                return self.chat_serving.create_error_response(
+                    "web_search was required, but no searchable user text was found",
+                    "BadRequestError",
+                    400,
+                )
+            return await self.chat_serving.handle_request(plain_request, raw_request)
+
+        try:
+            results = await self._run_builtin_web_search_query(query)
+        except Exception as exc:
+            logger.warning(
+                "builtin web_search prefetch failed for /v1/chat/completions: %s",
+                exc,
+            )
+            if self._requires_builtin_web_search(request):
+                return self.chat_serving.create_error_response(
+                    "web_search was required, but its backend is unavailable",
+                    "BadRequestError",
+                    400,
+                )
+            return await self.chat_serving.handle_request(plain_request, raw_request)
+
+        return await self.chat_serving.handle_request(
+            self._inject_builtin_web_search_results(request, query, results),
+            raw_request,
+        )
 
     @staticmethod
     def _has_response_tool(request: ResponsesRequest, *tool_types: str) -> bool:

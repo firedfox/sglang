@@ -8,12 +8,12 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
 import zmq
-from prometheus_client import Counter
+from prometheus_client import Counter, Gauge
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
@@ -81,9 +81,79 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
 
+
+def _log_bootstrap_stage(
+    role: str,
+    stage: str,
+    event: str,
+    bootstrap_room: int,
+    started_at: Optional[float] = None,
+    **fields,
+) -> None:
+    if started_at is not None:
+        fields = {
+            "duration_ms": f"{(time.monotonic() - started_at) * 1000:.3f}",
+            **fields,
+        }
+    details = " ".join(f"{key}={value}" for key, value in fields.items())
+    logger.info(
+        "%s bootstrap stage %s: stage=%s bootstrap_room=%s %s",
+        role,
+        event,
+        stage,
+        bootstrap_room,
+        details,
+    )
+
+
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
+)
+
+MOONCAKE_THREAD_UP = Gauge(
+    "sglang:mooncake_thread_up",
+    "Whether a Mooncake background thread is alive (1) or not (0).",
+    labelnames=[
+        "model_name",
+        "engine_type",
+        "thread_type",
+        "worker_id",
+        "dp_rank",
+        "tp_rank",
+        "cp_rank",
+        "pp_rank",
+    ],
+    multiprocess_mode="mostrecent",
+)
+MOONCAKE_THREAD_EXCEPTIONS = Counter(
+    "sglang:mooncake_thread_exceptions_total",
+    "Number of uncaught exceptions in Mooncake background threads.",
+    labelnames=[
+        "model_name",
+        "engine_type",
+        "thread_type",
+        "worker_id",
+        "dp_rank",
+        "tp_rank",
+        "cp_rank",
+        "pp_rank",
+    ],
+)
+MOONCAKE_THREAD_LAST_PROGRESS = Gauge(
+    "sglang:mooncake_thread_last_progress_timestamp_seconds",
+    "Unix timestamp of the last observed progress in a Mooncake background thread.",
+    labelnames=[
+        "model_name",
+        "engine_type",
+        "thread_type",
+        "worker_id",
+        "dp_rank",
+        "tp_rank",
+        "cp_rank",
+        "pp_rank",
+    ],
+    multiprocess_mode="mostrecent",
 )
 
 
@@ -259,6 +329,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self._mooncake_thread_observability_enabled = (
+            server_args.disaggregation_transfer_backend == "mooncake"
+        )
+        self._mooncake_threads: dict[tuple[str, str], threading.Thread] = {}
+        self._mooncake_thread_base_labels = {
+            "model_name": server_args.served_model_name,
+            "engine_type": self.disaggregation_mode.value,
+            "dp_rank": self.attn_dp_rank,
+            "tp_rank": self.attn_tp_rank,
+            "cp_rank": self.attn_cp_rank,
+            "pp_rank": self.pp_rank,
+        }
+        self._mooncake_thread_label_cache: dict[tuple[str, str], dict] = {}
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -270,6 +353,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._stopped = False
         self._worker_threads: List[threading.Thread] = []
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.prefill_bootstrap_start_times: dict[int, float] = {}
+            self.prefill_bootstrap_timing_lock = threading.Lock()
             self.session_failures = defaultdict(int)
             self.failed_sessions = set()
             # Separate from failed_sessions, which _run_one_probe_pass clears
@@ -279,6 +364,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Peers already cleared at registration; skip the per-transfer check.
             self.state_strides_validated: Set[str] = set()
             self.session_lock = threading.Lock()
+            configured_failure_threshold = (
+                envs.SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD.get()
+            )
+            self.session_failure_threshold = max(1, configured_failure_threshold)
+            if configured_failure_threshold < 1:
+                logger.warning(
+                    "SGLANG_MOONCAKE_SESSION_FAILURE_THRESHOLD=%s is invalid; "
+                    "using 1 instead",
+                    configured_failure_threshold,
+                )
             self.start_prefill_thread()
             # Determine the number of threads to use for kv sender
             cpu_count = os.cpu_count()
@@ -313,21 +408,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # Track the thread so teardown() can join it: otherwise every
                 # P->D->P flip that re-enters PREFILL leaks threads
                 # (each parked forever in FastQueue.get()).
-                t = threading.Thread(
-                    target=self.transfer_worker,
-                    args=(
-                        queue,
-                        executor,
-                        (
-                            self._staging_ctx.buffers[i]
-                            if self.enable_staging and self._staging_ctx.buffers
-                            else None
-                        ),
-                        i,
+                t = self._start_monitored_thread(
+                    thread_type="prefill_transfer_worker",
+                    target=lambda queue=queue, executor=executor, i=i: (
+                        self.transfer_worker(
+                            queue,
+                            executor,
+                            (
+                                self._staging_ctx.buffers[i]
+                                if self.enable_staging and self._staging_ctx.buffers
+                                else None
+                            ),
+                            i,
+                        )
                     ),
-                    daemon=True,
+                    worker_id=str(i),
                 )
-                t.start()
                 self._worker_threads.append(t)
             self.enable_failed_session_probe = (
                 envs.SGLANG_ENABLE_FAILED_SESSION_PROBE.get()
@@ -337,18 +433,126 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     envs.SGLANG_FAILED_SESSION_PROBE_INTERVAL_S.get()
                 )
                 self._failed_session_probe_shutdown = threading.Event()
-                t = threading.Thread(
+                t = self._start_monitored_thread(
+                    thread_type="failed_session_probe",
                     target=self._failed_session_probe_loop,
-                    name="MooncakeFailedSessionProbe",
-                    daemon=True,
                 )
-                t.start()
                 self._worker_threads.append(t)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self._staging_ctx = DecodeStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_allocator()
             self.start_decode_thread()
+
+    def _thread_metric_labels(self, thread_type: str, worker_id: str) -> dict:
+        key = (thread_type, worker_id)
+        labels = self._mooncake_thread_label_cache.get(key)
+        if labels is None:
+            labels = {
+                **self._mooncake_thread_base_labels,
+                "thread_type": thread_type,
+                "worker_id": worker_id,
+            }
+            self._mooncake_thread_label_cache[key] = labels
+        return labels
+
+    def _mark_thread_progress(self, thread_type: str, worker_id: str = "") -> None:
+        if not (
+            getattr(self, "_mooncake_thread_observability_enabled", False)
+            and self.server_args.enable_metrics
+        ):
+            return
+        MOONCAKE_THREAD_LAST_PROGRESS.labels(
+            **self._thread_metric_labels(thread_type, worker_id)
+        ).set(time.time())
+
+    def _run_monitored_thread(
+        self, thread_type: str, worker_id: str, target: Callable[[], None]
+    ) -> None:
+        labels = self._thread_metric_labels(thread_type, worker_id)
+        metrics_enabled = (
+            getattr(self, "_mooncake_thread_observability_enabled", False)
+            and self.server_args.enable_metrics
+        )
+        if metrics_enabled:
+            MOONCAKE_THREAD_UP.labels(**labels).set(1)
+            self._mark_thread_progress(thread_type=thread_type, worker_id=worker_id)
+        logger.info("Mooncake background thread started: %s", labels)
+        try:
+            target()
+        except BaseException:
+            if metrics_enabled:
+                MOONCAKE_THREAD_EXCEPTIONS.labels(**labels).inc()
+            logger.exception("Mooncake background thread crashed: %s", labels)
+            raise
+        finally:
+            if metrics_enabled:
+                MOONCAKE_THREAD_UP.labels(**labels).set(0)
+            logger.info("Mooncake background thread exited: %s", labels)
+
+    def _start_monitored_thread(
+        self,
+        thread_type: str,
+        target: Callable[[], None],
+        *,
+        worker_id: str = "",
+        daemon: bool = True,
+    ) -> threading.Thread:
+        name = (
+            f"Mooncake-{thread_type}-DP{self.attn_dp_rank}-TP{self.attn_tp_rank}"
+            f"-CP{self.attn_cp_rank}-PP{self.pp_rank}"
+        )
+        if worker_id:
+            name = f"{name}-W{worker_id}"
+        thread = threading.Thread(
+            target=self._run_monitored_thread,
+            args=(thread_type, worker_id, target),
+            daemon=daemon,
+            name=name,
+        )
+        self._mooncake_threads[(thread_type, worker_id)] = thread
+        thread.start()
+        return thread
+
+    def _mark_heartbeat_checker_progress(self):
+        self._mark_thread_progress(thread_type="decode_heartbeat")
+
+    def _start_heartbeat_checker(self, target: Callable[[], None]):
+        return self._start_monitored_thread(
+            thread_type="decode_heartbeat", target=target
+        )
+
+    def _record_session_transfer_failure(self, session_id: str) -> bool:
+        """Count a KV transfer failure and blacklist at the configured threshold."""
+        with self.session_lock:
+            failures = self.session_failures[session_id] + 1
+            self.session_failures[session_id] = failures
+            should_blacklist = failures >= self.session_failure_threshold
+            if should_blacklist:
+                self.failed_sessions.add(session_id)
+
+        if should_blacklist:
+            logger.error(
+                "Mooncake session %s reached the transfer failure threshold "
+                "(failures=%s threshold=%s)",
+                session_id,
+                failures,
+                self.session_failure_threshold,
+            )
+        else:
+            logger.warning(
+                "Mooncake session %s transfer failed but remains active "
+                "(failures=%s threshold=%s)",
+                session_id,
+                failures,
+                self.session_failure_threshold,
+            )
+        return should_blacklist
+
+    def _reset_session_transfer_failures(self, session_id: str) -> None:
+        """A successful KV transfer breaks the consecutive-failure sequence."""
+        with self.session_lock:
+            self.session_failures.pop(session_id, None)
 
     def init_engine(self):
         self.engine = get_mooncake_transfer_engine()
@@ -2444,6 +2648,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                self._mark_thread_progress(
+                    thread_type="prefill_transfer_worker", worker_id=str(worker_index)
+                )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2666,14 +2873,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_kv_layer_ids,
                             )
                         if ret != 0:
-                            with self.session_lock:
-                                self.session_failures[req.mooncake_session_id] += 1
-                                # Failures should never happen if the session is not dead, if the session fails once, mark it as failed
-                                if self.session_failures[req.mooncake_session_id] >= 1:
-                                    self.failed_sessions.add(req.mooncake_session_id)
-                                    logger.error(
-                                        f"Session {req.mooncake_session_id} failed."
-                                    )
+                            self._record_session_transfer_failure(
+                                req.mooncake_session_id
+                            )
                             self._poison_unsettled_send(kv_chunk.room)
                             self.conclude_failure(
                                 bootstrap_room=kv_chunk.room,
@@ -2683,6 +2885,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 ),
                             )
                             break
+
+                        self._reset_session_transfer_failures(req.mooncake_session_id)
 
                         if kv_chunk.is_last_chunk:
                             if kv_chunk.state_indices and not skip_state:
@@ -2892,6 +3096,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 waiting_req_bytes = recv()
                 if waiting_req_bytes is None:
                     continue
+                self._mark_thread_progress(thread_type="prefill_bootstrap")
                 room = waiting_req_bytes[0].decode("ascii")
                 # Staging: decode reports consumption watermark back to prefill
                 if room == "WATERMARK":
@@ -2940,29 +3145,88 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         )
                     continue
                 else:
+                    metadata_parse_started_at = time.monotonic()
                     required_dst_info_num = int(waiting_req_bytes[7].decode("ascii"))
                     room = int(room)
-                    if room not in self.transfer_infos:
-                        self.transfer_infos[room] = {}
-
-                    self.transfer_infos[room][mooncake_session_id] = (
-                        TransferInfo.from_zmq(waiting_req_bytes)
+                    received_before = len(self.transfer_infos.get(room, {}))
+                    _log_bootstrap_stage(
+                        "Prefill",
+                        "metadata_parse",
+                        "start",
+                        room,
+                        session_id=mooncake_session_id,
+                        decode_endpoint=(
+                            f"{waiting_req_bytes[1].decode('ascii')}:"
+                            f"{waiting_req_bytes[2].decode('ascii')}"
+                        ),
+                        received_metadata=received_before,
+                        required_metadata=required_dst_info_num,
+                    )
+                    transfer_info = TransferInfo.from_zmq(waiting_req_bytes)
+                    # Keep a local snapshot alive while post-processing. The
+                    # cleanup path may concurrently remove the manager entry.
+                    room_transfer_infos = self.transfer_infos.setdefault(room, {})
+                    room_transfer_infos[mooncake_session_id] = transfer_info
+                    received_metadata = len(room_transfer_infos)
+                    _log_bootstrap_stage(
+                        "Prefill",
+                        "metadata_parse",
+                        "end",
+                        room,
+                        started_at=metadata_parse_started_at,
+                        session_id=mooncake_session_id,
+                        kv_indices_count=len(transfer_info.dst_kv_indices),
+                        decode_prefix_len=transfer_info.decode_prefix_len,
+                        is_dummy=transfer_info.is_dummy,
+                        received_metadata=received_metadata,
+                        required_metadata=required_dst_info_num,
                     )
                     # NOTE: after bootstrapping we can mark the req as waiting for input
-                    if len(self.transfer_infos[room]) == required_dst_info_num:
-                        self.resolve_kv_replica_factor(self.transfer_infos[room])
-                        self.req_to_decode_prefix_len[room] = next(
+                    if received_metadata == required_dst_info_num:
+                        self.resolve_kv_replica_factor(room_transfer_infos)
+                        decode_prefix_len = next(
                             (
                                 info.decode_prefix_len
-                                for info in self.transfer_infos[room].values()
+                                for info in room_transfer_infos.values()
                                 if info.decode_prefix_len is not None
                             ),
                             0,
                         )
+                        self.req_to_decode_prefix_len[room] = decode_prefix_len
                         self.update_status(room, KVPoll.WaitingForInput)
+                        with self.prefill_bootstrap_timing_lock:
+                            wait_started_at = self.prefill_bootstrap_start_times.pop(
+                                room, None
+                            )
+                        wait_duration_ms = (
+                            (time.monotonic() - wait_started_at) * 1000
+                            if wait_started_at is not None
+                            else -1.0
+                        )
+                        total_kv_indices = sum(
+                            len(info.dst_kv_indices)
+                            for info in room_transfer_infos.values()
+                        )
+                        _log_bootstrap_stage(
+                            "Prefill",
+                            "metadata_wait",
+                            "end",
+                            room,
+                            result="success",
+                            duration_ms=f"{wait_duration_ms:.3f}",
+                            status="WaitingForInput",
+                            received_metadata=received_metadata,
+                            required_metadata=required_dst_info_num,
+                            total_kv_indices_count=total_kv_indices,
+                            decode_prefix_len=decode_prefix_len,
+                            tp_rank=self.attn_tp_rank,
+                            dp_rank=self.attn_dp_rank,
+                            pp_rank=self.pp_rank,
+                        )
 
-        t = threading.Thread(target=bootstrap_thread, daemon=True)
-        t.start()
+        t = self._start_monitored_thread(
+            thread_type="prefill_bootstrap", target=bootstrap_thread
+        )
         self._worker_threads.append(t)
 
     def start_decode_thread(self):
@@ -2973,6 +3237,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 msg = recv()
                 if msg is None:
                     continue
+                self._mark_thread_progress(thread_type="decode_receiver")
                 if msg[0] == MooncakeKVManager.AUX_DATA_HEADER:
                     self._handle_aux_data(msg)
                     continue
@@ -3016,8 +3281,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     failure_reason=reason,
                 )
 
-        t = threading.Thread(target=decode_thread, daemon=True)
-        t.start()
+        t = self._start_monitored_thread(
+            thread_type="decode_receiver", target=decode_thread
+        )
         self._worker_threads.append(t)
         t = self._start_heartbeat_checker_thread()
         self._worker_threads.append(t)
@@ -3114,6 +3380,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         while not self._failed_session_probe_shutdown.wait(
             self.failed_session_probe_interval
         ):
+            self._mark_thread_progress(thread_type="failed_session_probe")
             self._run_one_probe_pass()
 
 
@@ -3160,6 +3427,57 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
         )
         self.init_time = time.time()
         self._init_trace_ctx()
+        with mgr.prefill_bootstrap_timing_lock:
+            should_wait_for_metadata = (
+                mgr.request_status.get(bootstrap_room) == KVPoll.Bootstrapping
+            )
+            if should_wait_for_metadata:
+                metadata_wait_started_at = time.monotonic()
+                mgr.prefill_bootstrap_start_times[bootstrap_room] = (
+                    metadata_wait_started_at
+                )
+            else:
+                mgr.prefill_bootstrap_start_times.pop(bootstrap_room, None)
+        if should_wait_for_metadata:
+            _log_bootstrap_stage(
+                "Prefill",
+                "metadata_wait",
+                "start",
+                bootstrap_room,
+                timeout_s=mgr.bootstrap_timeout,
+                tp_rank=mgr.attn_tp_rank,
+                dp_rank=mgr.attn_dp_rank,
+                pp_rank=mgr.pp_rank,
+            )
+
+    def _finish_metadata_wait_log(self, result: str) -> None:
+        with self.kv_mgr.prefill_bootstrap_timing_lock:
+            wait_started_at = self.kv_mgr.prefill_bootstrap_start_times.pop(
+                self.bootstrap_room, None
+            )
+        if wait_started_at is None:
+            return
+        transfer_infos = self.kv_mgr.transfer_infos.get(self.bootstrap_room, {})
+        required_metadata = next(
+            (info.required_dst_info_num for info in transfer_infos.values()),
+            None,
+        )
+        _log_bootstrap_stage(
+            "Prefill",
+            "metadata_wait",
+            "end",
+            self.bootstrap_room,
+            started_at=wait_started_at,
+            result=result,
+            received_metadata=len(transfer_infos),
+            required_metadata=required_metadata,
+            total_kv_indices_count=sum(
+                len(info.dst_kv_indices) for info in transfer_infos.values()
+            ),
+            tp_rank=self.kv_mgr.attn_tp_rank,
+            dp_rank=self.kv_mgr.attn_dp_rank,
+            pp_rank=self.kv_mgr.pp_rank,
+        )
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
@@ -3232,6 +3550,12 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
         return status
 
+    def clear(self) -> None:
+        self._finish_metadata_wait_log(
+            "failed" if self.conclude_state == KVPoll.Failed else "cleared"
+        )
+        super().clear()
+
     def _init_trace_ctx(self):
         if self.kv_mgr.enable_trace:
             self.trace_ctx = TraceReqContext(
@@ -3249,6 +3573,7 @@ class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
 
     def abort(self):
         super().abort()
+        self._finish_metadata_wait_log("aborted")
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
@@ -3262,10 +3587,96 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
     ):
         self.session_id = mgr.get_session_id()
         self.init_time = None
+        self._last_bootstrap_wait_reason = None
+        self._last_bootstrap_wait_log_at = 0.0
         super().__init__(mgr, bootstrap_addr, bootstrap_room)
+        self.bootstrap_started_at = time.monotonic()
+        _log_bootstrap_stage(
+            "Decode",
+            "bootstrap",
+            "start",
+            self.bootstrap_room,
+            session_id=self.session_id,
+            bootstrap_addr=self.bootstrap_addr,
+            tp_rank=self.kv_mgr.attn_tp_rank,
+            dp_rank=self.kv_mgr.attn_dp_rank,
+            pp_rank=self.kv_mgr.pp_rank,
+        )
+
+    def log_bootstrap_stage(
+        self,
+        stage: str,
+        event: str,
+        started_at: Optional[float] = None,
+        **fields,
+    ) -> None:
+        _log_bootstrap_stage(
+            "Decode",
+            stage,
+            event,
+            self.bootstrap_room,
+            started_at=started_at,
+            session_id=self.session_id,
+            **fields,
+        )
+
+    def log_bootstrap_wait(self, reason: str, **fields) -> None:
+        now = time.monotonic()
+        if (
+            reason != self._last_bootstrap_wait_reason
+            or now - self._last_bootstrap_wait_log_at >= 10
+        ):
+            self.log_bootstrap_stage(
+                "kv_prealloc_wait",
+                "wait",
+                reason=reason,
+                **fields,
+            )
+            self._last_bootstrap_wait_reason = reason
+            self._last_bootstrap_wait_log_at = now
+
+    def init(self, prefill_dp_rank: int):
+        started_at = time.monotonic()
+        result = "exception"
+        self.log_bootstrap_stage(
+            "receiver_init",
+            "start",
+            prefill_dp_rank=prefill_dp_rank,
+            bootstrap_addr=self.bootstrap_addr,
+        )
+        try:
+            super().init(prefill_dp_rank)
+            result = "failed" if self.conclude_state == KVPoll.Failed else "success"
+        finally:
+            bootstrap_infos = getattr(self, "bootstrap_infos", None)
+            self.log_bootstrap_stage(
+                "receiver_init",
+                "end",
+                started_at=started_at,
+                result=result,
+                status=self.kv_mgr.check_status(self.bootstrap_room),
+                bootstrap_target_count=(
+                    len(bootstrap_infos) if bootstrap_infos is not None else 0
+                ),
+                required_metadata=getattr(self, "required_dst_info_num", None),
+                prefill_dp_rank=prefill_dp_rank,
+            )
 
     def _register_kv_args(self) -> bool:
         for bootstrap_info in self.bootstrap_infos:
+            started_at = time.monotonic()
+            result = "exception"
+            endpoint = (
+                f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+            )
+            self.log_bootstrap_stage(
+                "kv_args_register",
+                "start",
+                prefill_endpoint=endpoint,
+                kv_data_ptr_count=len(self.kv_mgr.kv_args.kv_data_ptrs),
+                aux_data_ptr_count=len(self.kv_mgr.kv_args.aux_data_ptrs),
+                state_data_ptr_group_count=len(self.kv_mgr.kv_args.state_data_ptrs),
+            )
             packed_kv_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
             )
@@ -3348,6 +3759,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             ),
                         ]
                     )
+                result = "success"
             except zmq.ZMQError:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
@@ -3356,6 +3768,14 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return False
+            finally:
+                self.log_bootstrap_stage(
+                    "kv_args_register",
+                    "end",
+                    started_at=started_at,
+                    result=result,
+                    prefill_endpoint=endpoint,
+                )
         return True
 
     def send_metadata(
@@ -3367,6 +3787,12 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
         device_kv_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         if self.bootstrap_infos is None:
+            self.log_bootstrap_stage(
+                "metadata_send",
+                "skip",
+                result="no_bootstrap_info",
+                kv_indices_count=len(kv_indices),
+            )
             self.kv_mgr.record_failure(
                 self.bootstrap_room,
                 f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
@@ -3385,6 +3811,21 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
 
         for bootstrap_info in self.bootstrap_infos:
             is_dummy = bootstrap_info["is_dummy"]
+            started_at = time.monotonic()
+            result = "exception"
+            endpoint = (
+                f"{bootstrap_info.get('rank_ip')}:{bootstrap_info.get('rank_port')}"
+            )
+            self.log_bootstrap_stage(
+                "metadata_send",
+                "start",
+                prefill_endpoint=endpoint,
+                kv_indices_count=len(kv_indices),
+                is_dummy=is_dummy,
+                decode_prefix_len=decode_prefix_len or 0,
+                state_group_count=len(state_indices or []),
+                required_metadata=self.required_dst_info_num,
+            )
             try:
                 sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
                 with lock:
@@ -3410,6 +3851,7 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                             ),
                         ]
                     )
+                result = "success"
             except zmq.ZMQError:
                 self.invalidate_cached_bootstrap_infos()
                 self.kv_mgr.record_failure(
@@ -3419,7 +3861,22 @@ class MooncakeKVReceiver(MooncakeFailureExceptionMixin, CommonKVReceiver):
                 self.conclude_state = KVPoll.Failed
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                 return
+            finally:
+                self.log_bootstrap_stage(
+                    "metadata_send",
+                    "end",
+                    started_at=started_at,
+                    result=result,
+                    prefill_endpoint=endpoint,
+                )
         self.init_time = time.time()
+        self.log_bootstrap_stage(
+            "bootstrap",
+            "end",
+            started_at=self.bootstrap_started_at,
+            result="metadata_sent",
+            bootstrap_target_count=len(self.bootstrap_infos),
+        )
 
 
 class MooncakeKVBootstrapServer(CommonKVBootstrapServer):

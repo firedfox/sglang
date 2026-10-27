@@ -1167,7 +1167,37 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             self._ensure_last_attempt_time[bootstrap_addr] = now
 
-            if self.kv_manager.try_ensure_parallel_info(bootstrap_addr):
+            started_at = time.monotonic()
+            for decode_req in reqs:
+                if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+                    decode_req.kv_receiver.log_bootstrap_stage(
+                        "parallel_info_resolve",
+                        "start",
+                        bootstrap_addr=bootstrap_addr,
+                        attempt=self._ensure_retry_count.get(bootstrap_addr, 0) + 1,
+                    )
+            parallel_info_ready = False
+            parallel_info_result = "exception"
+            try:
+                parallel_info_ready = self.kv_manager.try_ensure_parallel_info(
+                    bootstrap_addr
+                )
+                parallel_info_result = "success" if parallel_info_ready else "retry"
+            finally:
+                for decode_req in reqs:
+                    if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+                        decode_req.kv_receiver.log_bootstrap_stage(
+                            "parallel_info_resolve",
+                            "end",
+                            started_at=started_at,
+                            result=parallel_info_result,
+                            bootstrap_addr=bootstrap_addr,
+                            attempt=(
+                                self._ensure_retry_count.get(bootstrap_addr, 0) + 1
+                            ),
+                        )
+
+            if parallel_info_ready:
                 if bootstrap_addr in self._ensure_retry_count:
                     del self._ensure_retry_count[bootstrap_addr]
                 if bootstrap_addr in self._ensure_last_attempt_time:
@@ -1262,26 +1292,51 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Pass 2: resolve dp rank for addrs whose info is available
             if need_query:
                 rooms = [decode_req.req.bootstrap_room for decode_req in need_query]
-                prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
-                prefetched_rooms = prefetched[0] if prefetched is not None else ()
-                if (
-                    prefetched is not None
-                    and tuple(rooms[: len(prefetched_rooms)]) == prefetched_rooms
-                ):
-                    room_to_rank = prefetched[1].result()
-                    remaining_rooms = rooms[len(prefetched_rooms) :]
-                    if remaining_rooms:
-                        room_to_rank.update(
-                            CommonKVReceiver.query_prefill_dp_ranks(
-                                bootstrap_addr, remaining_rooms
-                            )
+                started_at = time.monotonic()
+                room_to_rank: Dict[str, int] = {}
+                for decode_req in need_query:
+                    if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+                        decode_req.kv_receiver.log_bootstrap_stage(
+                            "prefill_dp_rank_resolve",
+                            "start",
+                            bootstrap_addr=bootstrap_addr,
                         )
-                else:
-                    if prefetched is not None:
-                        prefetched[1].cancel()
-                    room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
-                        bootstrap_addr, rooms
-                    )
+                try:
+                    prefetched = self._prefill_dp_rank_queries.pop(bootstrap_addr, None)
+                    prefetched_rooms = prefetched[0] if prefetched is not None else ()
+                    if (
+                        prefetched is not None
+                        and tuple(rooms[: len(prefetched_rooms)]) == prefetched_rooms
+                    ):
+                        room_to_rank = prefetched[1].result()
+                        remaining_rooms = rooms[len(prefetched_rooms) :]
+                        if remaining_rooms:
+                            room_to_rank.update(
+                                CommonKVReceiver.query_prefill_dp_ranks(
+                                    bootstrap_addr, remaining_rooms
+                                )
+                            )
+                    else:
+                        if prefetched is not None:
+                            prefetched[1].cancel()
+                        room_to_rank = CommonKVReceiver.query_prefill_dp_ranks(
+                            bootstrap_addr, rooms
+                        )
+                finally:
+                    for decode_req in need_query:
+                        if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+                            decode_req.kv_receiver.log_bootstrap_stage(
+                                "prefill_dp_rank_resolve",
+                                "end",
+                                started_at=started_at,
+                                result=(
+                                    "success"
+                                    if str(decode_req.req.bootstrap_room)
+                                    in room_to_rank
+                                    else "not_found"
+                                ),
+                                bootstrap_addr=bootstrap_addr,
+                            )
                 for decode_req in need_query:
                     prefill_dp_rank = room_to_rank.get(
                         str(decode_req.req.bootstrap_room)
@@ -1425,6 +1480,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                if hasattr(decode_req.kv_receiver, "log_bootstrap_wait"):
+                    decode_req.kv_receiver.log_bootstrap_wait(
+                        "metadata_buffer_exhausted",
+                        rid=decode_req.req.rid,
+                        available_metadata_slots=0,
+                    )
                 break
 
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
@@ -1449,6 +1510,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_token_pool.available_size() <= 0:
+                if hasattr(decode_req.kv_receiver, "log_bootstrap_wait"):
+                    decode_req.kv_receiver.log_bootstrap_wait(
+                        "request_pool_exhausted",
+                        rid=decode_req.req.rid,
+                        available_request_slots=0,
+                    )
                 break
 
             # Reserve enough Mamba capacity for radix COW and tracking buffers
@@ -1459,6 +1526,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 break
 
             if hisparse_req_budget <= 0:
+                if hasattr(decode_req.kv_receiver, "log_bootstrap_wait"):
+                    decode_req.kv_receiver.log_bootstrap_wait(
+                        "hisparse_request_budget_exhausted",
+                        rid=decode_req.req.rid,
+                        hisparse_request_budget=hisparse_req_budget,
+                    )
                 break
 
             # Memory estimation: don't add if the projected memory cannot be met
@@ -1544,6 +1617,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 full_allocatable_tokens=full_allocatable_tokens,
                 swa_allocatable_tokens=swa_allocatable_tokens,
             ):
+                if hasattr(decode_req.kv_receiver, "log_bootstrap_wait"):
+                    decode_req.kv_receiver.log_bootstrap_wait(
+                        "decode_safety_budget_insufficient",
+                        rid=decode_req.req.rid,
+                        required_tokens=full_required_for_admission,
+                        allocatable_tokens=full_allocatable_tokens,
+                        swa_required_tokens=swa_required_for_admission,
+                        swa_allocatable_tokens=swa_allocatable_tokens,
+                        retractable_tokens=retractable_tokens,
+                    )
                 if prefix_match is not None and prefix_match.l1_prefix_len > 0:
                     self.tree_cache.unlock(decode_req.req.lock)
                     decode_req.req.lock = None
@@ -1573,12 +1656,36 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     failed_reqs.append(decode_req)
                     indices_to_remove.add(i)
                     continue
-            dst_kv_indices = self._pre_alloc(
-                decode_req.req,
-                prefix_indices,
-                prefix_len,
-                total_prefix_len,
-            )
+            prealloc_started_at = time.monotonic()
+            dst_kv_indices = None
+            if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+                decode_req.kv_receiver.log_bootstrap_stage(
+                    "kv_prealloc",
+                    "start",
+                    rid=decode_req.req.rid,
+                    required_tokens=required_alloc_tokens,
+                    allocatable_tokens=full_allocatable_tokens,
+                    prefix_len=prefix_len,
+                    decode_prefix_len=total_prefix_len,
+                )
+            try:
+                dst_kv_indices = self._pre_alloc(
+                    decode_req.req, prefix_indices, prefix_len, total_prefix_len
+                )
+            finally:
+                if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+                    decode_req.kv_receiver.log_bootstrap_stage(
+                        "kv_prealloc",
+                        "end",
+                        started_at=prealloc_started_at,
+                        result="success" if dst_kv_indices is not None else "exception",
+                        rid=decode_req.req.rid,
+                        allocated_kv_indices_count=len(dst_kv_indices)
+                        if dst_kv_indices is not None
+                        else 0,
+                        allocatable_tokens_before=full_allocatable_tokens,
+                        allocator_available_tokens_after=self.token_to_kv_pool_allocator.available_size(),
+                    )
             decode_req.prefix_match = prefix_match
             if self.scheduler.enable_decode_hicache:
                 self._start_hicache_prefetch(decode_req.req, prefix_match)
@@ -1786,6 +1893,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _send_kv_metadata(
         self, decode_req, kv_indices, page_size, state_indices=None, **metadata_kwargs
     ) -> None:
+        metadata_prepare_started_at = time.monotonic()
+        if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+            decode_req.kv_receiver.log_bootstrap_stage(
+                "metadata_prepare",
+                "start",
+                rid=decode_req.req.rid,
+                kv_indices_count=len(kv_indices),
+            )
         decode_req.metadata_buffer_index = (
             self.req_to_metadata_buffer_idx_allocator.alloc()
         )
@@ -1801,6 +1916,18 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # prefetch (dropped for an unregistered room); tiny race, correct order.
             self.transfer_queue.staging_handler.register_decode_req(
                 decode_req.req.bootstrap_room, decode_req
+            )
+        if hasattr(decode_req.kv_receiver, "log_bootstrap_stage"):
+            decode_req.kv_receiver.log_bootstrap_stage(
+                "metadata_prepare",
+                "end",
+                started_at=metadata_prepare_started_at,
+                result="success",
+                rid=decode_req.req.rid,
+                kv_indices_count=len(kv_indices),
+                page_indices_count=len(page_indices),
+                state_group_count=len(state_indices or []),
+                metadata_buffer_index=decode_req.metadata_buffer_index,
             )
         decode_req.kv_receiver.send_metadata(
             page_indices,

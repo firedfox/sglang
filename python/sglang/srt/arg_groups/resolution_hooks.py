@@ -14,13 +14,16 @@ from typing import Any, Callable, Dict, FrozenSet, List
 _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
         "handle_deprecated_dp_attention",
+        "validate_dp_admission",
         "handle_mega_moe",
         "handle_return_hidden_states_mode",
         "handle_media_url_security",
         "handle_watermark_config",
         "handle_hicache_ratio_default",
+        "validate_hicache_prefetch_cost_model",
         "handle_offload_compatibility",
         "validate_prefill_decode_interval",
+        "validate_prefill_time_budget",
         "default_unset_prefill_decode_interval",
         "validate_response_store",
         "validate_sampling_mask_max_tokens",

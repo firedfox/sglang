@@ -167,10 +167,25 @@ class Memory(msgspec.Struct):
     hicache_storage_prefetch_policy: A[
         str,
         Arg(
-            help="Control when prefetching from the storage backend should stop.",
-            choices=["best_effort", "wait_complete", "timeout"],
+            help=(
+                "Control when prefetching from the storage backend should stop. "
+                "cost_aware compares remaining read time with recomputation "
+                "using --hicache-storage-prefetch-cost-model and falls back "
+                "to the existing timeout when no estimate is available."
+            ),
+            choices=["best_effort", "wait_complete", "timeout", "cost_aware"],
         ),
     ] = "timeout"
+    hicache_storage_prefetch_cost_model: A[
+        Optional[str],
+        "JSON cost model for the optional cost_aware L3 prefetch policy. "
+        "Requires positive recompute_tokens_per_second. Optional fields: "
+        "read_tokens_per_second (positive calibrated rate; otherwise use "
+        "observed transfer progress), min_observation_seconds (default 0.05), "
+        "cancel_margin (at least 1, default 1.2), recompute_fixed_seconds "
+        "(default 0). Rates use logical tokens for the complete TP/CP group. "
+        "Without a model or a usable read estimate, the timeout policy applies.",
+    ] = None
     hicache_storage_backend_extra_config: A[
         Optional[str],
         "A dictionary in JSON string format, or a string starting with a leading '@' and a config file in JSON/YAML/TOML format, containing extra configuration for the storage backend.",

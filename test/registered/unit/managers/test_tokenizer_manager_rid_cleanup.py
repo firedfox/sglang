@@ -21,6 +21,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import torch
 from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,6 +31,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.utils import DisaggregationMode  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
+from sglang.srt.managers.embed_types import PositionalEmbeds  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
@@ -330,6 +332,69 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
                 with self.assertRaises(StopAsyncIteration):
                     await anext(stream)
+
+    async def test_non_stream_abort_with_gateway_error_is_raised(self):
+        """A non-stream abort carrying a gateway status such as 502 must become an HTTP error, not an empty 200."""
+        state = _make_req_state("gateway_abort")
+        state.obj.stream = False
+        self.tm.rid_to_state[state.obj.rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 502,
+                    "message": "encoder dispatch failed",
+                }
+            }
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+
+    async def test_admission_rejection_raises_before_stream_output(self):
+        for status in (400, 429, 503):
+            with self.subTest(status=status):
+                state = _make_req_state(f"admission_{status}")
+                state.obj.stream = True
+                self.tm.rid_to_state[state.obj.rid] = state
+                stream = self.tm._wait_one_response(state.obj)
+                pending = asyncio.create_task(anext(stream))
+                await asyncio.sleep(0)
+                self.tm._handle_abort_req(
+                    AbortReq(
+                        rid=state.obj.rid,
+                        finished_reason={
+                            "type": "abort",
+                            "status_code": status,
+                            "message": "DP admission rejected the request",
+                            "dp_admission_rejected": 1,
+                        },
+                    )
+                )
+                with self.assertRaises(HTTPException) as ctx:
+                    await pending
+                self.assertEqual(ctx.exception.status_code, status)
+                self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+                await stream.aclose()
+
+    async def test_admission_rejection_keeps_newer_state_with_same_rid(self):
+        old_state = _make_req_state("reused_admission_rid")
+        new_state = _make_req_state(old_state.obj.rid)
+        self.tm.rid_to_state[old_state.obj.rid] = new_state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 429,
+                    "message": "DP admission rejected the request",
+                    "dp_admission_rejected": 1,
+                }
+            }
+        }
+        with self.assertRaises(HTTPException):
+            await self.tm._handle_abort_finish_reason(out, old_state, is_stream=True)
+        self.assertIs(self.tm.rid_to_state[old_state.obj.rid], new_state)
 
     async def test_http_timeout_still_checks_disconnection(self):
         request = Mock()
@@ -1101,6 +1166,192 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
     request reaches the scheduler (e.g. input-length validation rejecting an
     over-context request) used to leak those entries permanently.
     """
+
+    def test_admission_rejects_streaming_fanout_before_creating_states(self):
+        for fields in (
+            {"text": ["first", "second"]},
+            {"text": "prompt", "sampling_params": {"n": 2}},
+        ):
+            with self.subTest(fields=fields):
+                tm = _make_tm_for_generate(self)
+                tm._init_req_state = Mock()
+                tm._tokenize_one_request = AsyncMock()
+                tm._send_one_request = AsyncMock()
+                obj = GenerateReqInput(**fields, stream=True)
+
+                async def drive():
+                    with self.assertRaises(HTTPException) as ctx:
+                        await anext(tm.generate_request(obj))
+                    self.assertEqual(ctx.exception.status_code, 400)
+                    self.assertIn("single sequence", ctx.exception.detail)
+
+                with patch(
+                    "sglang.srt.managers.tokenizer_manager.get_parallel",
+                    return_value=SimpleNamespace(enable_dp_admission=True),
+                ):
+                    asyncio.run(drive())
+                tm._init_req_state.assert_not_called()
+                tm._tokenize_one_request.assert_not_called()
+                tm._send_one_request.assert_not_called()
+                self.assertEqual(tm.rid_to_state, {})
+
+    def _assert_admission_rejected_before_transport(self, obj):
+        tm = _make_tm_for_generate(self)
+        tm._init_req_state = Mock()
+        tm._handle_epd_disaggregation_encode_request = Mock()
+        tm._tokenize_one_request = AsyncMock()
+        tm._batch_tokenize_and_process = AsyncMock()
+        tm.cuda_vmm_feature_transport = SimpleNamespace(
+            prepare_for_dispatch_async=AsyncMock()
+        )
+        tm.positional_embeds_transport = SimpleNamespace(prepare_for_dispatch=Mock())
+        tm._dispatch_to_scheduler = Mock()
+
+        async def drive():
+            with self.assertRaises(HTTPException) as ctx:
+                await anext(tm.generate_request(obj))
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("DP admission", ctx.exception.detail)
+
+        with patch(
+            "sglang.srt.managers.tokenizer_manager.get_parallel",
+            return_value=SimpleNamespace(enable_dp_admission=True),
+        ):
+            asyncio.run(drive())
+        tm._init_req_state.assert_not_called()
+        tm._handle_epd_disaggregation_encode_request.assert_not_called()
+        tm._tokenize_one_request.assert_not_called()
+        tm._batch_tokenize_and_process.assert_not_called()
+        tm.cuda_vmm_feature_transport.prepare_for_dispatch_async.assert_not_called()
+        tm.positional_embeds_transport.prepare_for_dispatch.assert_not_called()
+        tm._dispatch_to_scheduler.assert_not_called()
+        self.assertEqual(tm.rid_to_state, {})
+
+    def test_admission_rejects_unsupported_inputs_before_transport(self):
+        for batch in (False, True):
+            for field in (
+                "image_data",
+                "video_data",
+                "audio_data",
+                "input_embeds",
+                "positional_embed_overrides",
+                "session_id",
+                "session_params",
+                "sampling_params",
+                "need_wait_for_mm_inputs",
+                "num_items_assigned",
+                "encoder_urls",
+                "return_bytes",
+            ):
+                with self.subTest(batch=batch, field=field):
+                    fields = {"text": ["first", "second"] if batch else "prompt"}
+                    if field in ("image_data", "video_data", "audio_data"):
+                        fields[field] = [None, "media"] if batch else "media"
+                    elif field == "input_embeds":
+                        fields = {
+                            "input_embeds": (
+                                [[[0.1, 0.2]], [[0.3, 0.4]]] if batch else [[0.1, 0.2]]
+                            )
+                        }
+                    elif field == "positional_embed_overrides":
+                        overrides = PositionalEmbeds(torch.zeros(1, 2), [0])
+                        fields[field] = [None, overrides] if batch else overrides
+                    elif field == "session_id":
+                        fields[field] = "session"
+                    elif field == "session_params":
+                        fields[field] = {"id": "session"}
+                    elif field == "sampling_params":
+                        # A beam in a later batch element must also be rejected.
+                        fields[field] = (
+                            [{"beam_width": 1}, {"beam_width": 2}]
+                            if batch
+                            else {"beam_width": 2}
+                        )
+                    elif field == "num_items_assigned":
+                        fields[field] = {"image": [0]}
+                    elif field == "encoder_urls":
+                        fields[field] = ["http://encoder:8000"]
+                    else:
+                        fields[field] = True
+                    self._assert_admission_rejected_before_transport(
+                        GenerateReqInput(**fields)
+                    )
+
+    def test_admission_rejects_embedding_requests_before_transport(self):
+        for text in ("prompt", ["first", "second"]):
+            with self.subTest(text=text):
+                self._assert_admission_rejected_before_transport(
+                    EmbeddingReqInput(text=text)
+                )
+
+    def test_admission_allows_plain_non_streaming_batch_with_absent_media(self):
+        for explicit_absent in (False, True):
+            with self.subTest(explicit_absent=explicit_absent):
+                tm = _make_tm_for_generate(self)
+                tm._init_req_state = Mock(wraps=tm._init_req_state)
+                tm._should_use_batch_tokenization = Mock(return_value=False)
+                tm._tokenize_one_request = AsyncMock(
+                    side_effect=ValueError("plain batch reached tokenization")
+                )
+                fields = {}
+                if explicit_absent:
+                    fields = {
+                        "image_data": [None, None],
+                        "video_data": [None, None],
+                        "audio_data": [None, None],
+                        "positional_embed_overrides": [None, None],
+                        "need_wait_for_mm_inputs": False,
+                    }
+                obj = GenerateReqInput(
+                    text=["first", "second"],
+                    sampling_params=[{}, {"beam_width": 1}],
+                    **fields,
+                )
+
+                async def drive():
+                    with self.assertRaisesRegex(
+                        ValueError, "plain batch reached tokenization"
+                    ):
+                        await anext(tm.generate_request(obj))
+
+                with patch(
+                    "sglang.srt.managers.tokenizer_manager.get_parallel",
+                    return_value=SimpleNamespace(enable_dp_admission=True),
+                ):
+                    asyncio.run(drive())
+                self.assertFalse(obj.contains_mm_input())
+                tm._init_req_state.assert_called_once()
+                tm._tokenize_one_request.assert_awaited_once()
+                self.assertEqual(tm.rid_to_state, {})
+
+    def test_default_mode_keeps_unsupported_admission_shapes_on_existing_path(self):
+        for obj in (
+            GenerateReqInput(text="prompt", image_data="media"),
+            GenerateReqInput(
+                text="prompt",
+                positional_embed_overrides=PositionalEmbeds(torch.zeros(1, 2), [0]),
+            ),
+            EmbeddingReqInput(text="prompt"),
+        ):
+            with self.subTest(request_type=type(obj).__name__):
+                tm = _make_tm_for_generate(self)
+                tm._tokenize_one_request = AsyncMock(
+                    side_effect=ValueError("existing tokenization path")
+                )
+
+                async def drive():
+                    with self.assertRaisesRegex(
+                        ValueError, "existing tokenization path"
+                    ):
+                        await anext(tm.generate_request(obj))
+
+                with patch(
+                    "sglang.srt.managers.tokenizer_manager.get_parallel",
+                    return_value=SimpleNamespace(enable_dp_admission=False),
+                ):
+                    asyncio.run(drive())
+                tm._tokenize_one_request.assert_awaited_once()
+                self.assertEqual(tm.rid_to_state, {})
 
     def test_single_failure_before_dispatch_cleans_up(self):
         """Validation failure must return the adapter reference acquired earlier."""

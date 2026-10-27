@@ -44,6 +44,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Before any handler reads the DP layout.
     run_hook(handle_deprecated_dp_attention, server_args)
 
+    from sglang.srt.arg_groups.dp_admission_hook import validate_dp_admission
+
+    # Reject unsupported opt-ins before model downloads or dummy-model return.
+    run_hook(validate_dp_admission, server_args)
+
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)
@@ -72,9 +77,11 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.hicache_hook import (
         handle_hicache,
         handle_hicache_ratio_default,
+        validate_hicache_prefetch_cost_model,
     )
 
     run_hook(handle_hicache_ratio_default, server_args)
+    run_hook(validate_hicache_prefetch_cost_model, server_args)
     from sglang.srt.arg_groups.memory_hook import handle_offload_compatibility
 
     run_hook(handle_offload_compatibility, server_args)
@@ -82,11 +89,13 @@ def run_resolution_pipeline(server_args: Any) -> None:
         default_unset_prefill_decode_interval,
         validate_experimental_sgl_marlin,
         validate_prefill_decode_interval,
+        validate_prefill_time_budget,
         validate_response_store,
         validate_sampling_mask_max_tokens,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
+    run_hook(validate_prefill_time_budget, server_args)
     run_hook(validate_response_store, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
 
@@ -349,5 +358,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Validate after all batch-size declarations are visible.
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
+
+    # Recheck resolved topology, caches, and speculative settings after every
+    # declaration, including defaults selected from the model architecture.
+    run_hook(validate_dp_admission, server_args)
+
+    # Model capabilities can introduce dLLM/replay or disable chunking late.
+    run_hook(validate_prefill_time_budget, server_args)
 
     server_args._resolution_finished = True

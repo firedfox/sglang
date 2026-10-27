@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import math
 import os
 import random
 from collections import Counter
@@ -46,6 +47,9 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     split_cached_prefix_by_tier,
+)
+from sglang.srt.managers.scheduler_components.prefill_time_budget import (
+    PrefillTimeBudget,
 )
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
@@ -576,6 +580,7 @@ class _PrefillAdmission:
     extend_len: int
     max_new_tokens: int
     is_chunked: bool
+    time_limited: bool = False
 
 
 class PrefillAdder:
@@ -597,6 +602,8 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
+        prefill_time_budget: Optional[PrefillTimeBudget] = None,
+        truncation_align_size: Optional[int] = None,
     ):
         self.page_size = page_size
         self.prefill_tile_block_m = prefill_tile_block_m
@@ -608,6 +615,20 @@ class PrefillAdder:
         self.rem_chunk_tokens = rem_chunk_tokens
         self.chunked_req_limit: Optional[int] = None
         self.dllm_config = dllm_config
+        self.prefill_time_budget = prefill_time_budget
+        self.prefill_time_limited_requests = 0
+        self.prefill_time_overrun_requests = 0
+        self.time_truncation_align_size = truncation_align_size
+        self._time_budget_has_continuation = False
+        if prefill_time_budget is not None and (
+            rem_chunk_tokens is None
+            or rem_chunk_tokens <= 0
+            or num_mixed_decode_tokens
+            or dllm_config is not None
+        ):
+            raise ValueError(
+                "Prefill time budgeting requires chunked, non-mixed, non-dLLM prefill."
+            )
         # Mamba checkpoints only land on page-aligned chunk ends.
         self.exact_chunk_fill = (
             _use_exact_chunk_fill()
@@ -827,6 +848,84 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
+    def _time_budget_token_limit(
+        self,
+        *,
+        prefix_len: int,
+        remaining_tokens: int,
+        token_limit: int,
+        truncation_align_size: Optional[int] = None,
+    ) -> tuple[int, bool]:
+        if self.prefill_time_budget is None:
+            return token_limit, False
+        # The minimum-progress exception applies only to time. In particular,
+        # page-ceiled compute accounting must also fit max_prefill_tokens.
+        input_limit = self.rem_input_tokens
+        if not self.exact_chunk_fill:
+            input_limit = input_limit // self.page_size * self.page_size
+        alignment = math.lcm(
+            1 if self.exact_chunk_fill else self.page_size,
+            self.kv_shard_granule or 1,
+        )
+        extend_alignment = math.lcm(
+            truncation_align_size or self.time_truncation_align_size or 1,
+        )
+        selection_args = dict(
+            prefix_len=prefix_len,
+            remaining_tokens=remaining_tokens,
+            token_limit=max(0, min(token_limit, input_limit)),
+            alignment=alignment,
+            extend_alignment=extend_alignment,
+        )
+        selected = self.prefill_time_budget.select_tokens(
+            **selection_args, allow_minimum=not self.can_run_list
+        )
+        hard_cap_shape = self.prefill_time_budget.maximum_aligned_tokens(
+            **selection_args
+        )
+        return selected, selected < hard_cap_shape
+
+    def _prefill_time_load_back_prefix(self, req: Req) -> int:
+        prefix_len = req.prefix_len + req.host_hit_length
+        if (
+            self.prefill_time_budget is not None
+            and req.needs_host_load_back()
+            and isinstance(self.tree_cache, UnifiedRadixCache)
+            and self.tree_cache.buffer_pipeline is None
+            and not (
+                self.tree_cache.linker is not None
+                and self.tree_cache.linker.has_hit(req.rid)
+            )
+        ):
+            # A restored aux state can expose resident FULL behind a host hit.
+            # H2D must not be followed by a new rejection gate (its Mamba slot
+            # would then be freed by scheduler cleanup while the copy is pending).
+            # Select against the known final logical prefix before enqueueing
+            # H2D, so both cost and chunk alignment use the restored prefix.
+            path = self.tree_cache.tree_core.collect_path_info([req.best_match_node])[0]
+            if path:
+                prefix_len = max(prefix_len, path[-1].path_end)
+        return prefix_len
+
+    def _commit_prefill_time_budget(
+        self, req: Req, *, time_limited: bool = False
+    ) -> None:
+        if self.prefill_time_budget is None:
+            return
+        self.prefill_time_budget.charge(req.prefix_len, req.extend_len)
+        self.prefill_time_limited_requests += int(time_limited)
+        if self.prefill_time_budget.used_ms > self.prefill_time_budget.budget_ms:
+            self.prefill_time_overrun_requests += 1
+            logger.warning(
+                "Prefill time budget overrun: estimated=%.3f ms budget=%.3f ms "
+                "prefix=%d extend=%d; an empty batch permits one minimum "
+                "aligned chunk to make progress.",
+                self.prefill_time_budget.used_ms,
+                self.prefill_time_budget.budget_ms,
+                req.prefix_len,
+                req.extend_len,
+            )
+
     def budget_state(self):
         no_token = not self.memory_budget.has_capacity()
         # Gate new mamba slots separately: rem_total_tokens' full_evictable can't
@@ -837,6 +936,8 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         if self.rem_input_tokens <= 0:
+            return AddReqResult.OTHER
+        if self.prefill_time_budget is not None and self.prefill_time_budget.exhausted:
             return AddReqResult.OTHER
 
         if self.dllm_config is not None:
@@ -1130,6 +1231,15 @@ class PrefillAdder:
         )
         if _rem_tokens is None:
             return req
+        time_limited = False
+        if self.prefill_time_budget is not None:
+            _rem_tokens, time_limited = self._time_budget_token_limit(
+                prefix_len=req.prefix_len,
+                remaining_tokens=cand_extend_input_len,
+                token_limit=_rem_tokens,
+            )
+            if _rem_tokens <= 0:
+                return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         request_slot_reserve = self._request_slot_reserve_for_req(
@@ -1168,6 +1278,9 @@ class PrefillAdder:
             is_chunked_continuation=True,
             compute_charge=req.extend_len if self.exact_chunk_fill else None,
         )
+        self._commit_prefill_time_budget(req, time_limited=time_limited)
+        if self.prefill_time_budget is not None:
+            self._time_budget_has_continuation = truncated
 
         # Return if chunked prefill not finished
         return req if truncated else None
@@ -1189,8 +1302,32 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(
+        self,
+        req: Req,
+        *,
+        has_chunked_req: bool = False,
+        truncation_align_size: Optional[int] = None,
+    ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        chunk_limit = self.rem_chunk_tokens
+        time_limited = False
+        if self.prefill_time_budget is not None:
+            chunk_limit, time_limited = self._time_budget_token_limit(
+                prefix_len=req.prefix_len,
+                remaining_tokens=cand_extend_input_len,
+                token_limit=min(cand_extend_input_len, chunk_limit),
+                truncation_align_size=truncation_align_size,
+            )
+            if chunk_limit <= 0 or (
+                chunk_limit < cand_extend_input_len
+                and (
+                    has_chunked_req
+                    or self.new_chunked_req is not None
+                    or self._time_budget_has_continuation
+                )
+            ):
+                return AddReqResult.OTHER
         paged_input = (
             self.ceil_paged_tokens(cand_extend_input_len) + self.per_req_token_overhead
         )
@@ -1276,8 +1413,8 @@ class PrefillAdder:
 
             self._add_dllm_req(req)
         elif (
-            self.rem_chunk_tokens is None  # chunked prefill is disabled
-            or cand_extend_input_len <= self.rem_chunk_tokens  # it is the last chunk
+            chunk_limit is None  # chunked prefill is disabled
+            or cand_extend_input_len <= chunk_limit  # it is the last chunk
         ):
             if (
                 tile_stop := self._check_prefill_tile_budget(cand_extend_input_len)
@@ -1302,20 +1439,26 @@ class PrefillAdder:
                 compute_charge=(req.extend_len if self.exact_chunk_fill else None),
             )
         else:
-            if self.rem_chunk_tokens <= 0:
+            if chunk_limit <= 0:
                 return AddReqResult.OTHER
 
             # Chunked prefill
-            trunc_len = self.rem_chunk_tokens
+            trunc_len = chunk_limit
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
 
             # Reserve after the tile gate so rejected requests consume no scratch.
-            if not self._kv_shard_reserve_scratch(prefix_len=0, extend_len=trunc_len):
+            if not self._kv_shard_reserve_scratch(
+                prefix_len=req.prefix_len
+                if self.prefill_time_budget is not None
+                else 0,
+                extend_len=trunc_len,
+            ):
                 return AddReqResult.OTHER
 
-            assert req.prefix_len == 0
+            if self.prefill_time_budget is None:
+                assert req.prefix_len == 0
             req.extend_end = req.prefix_len + trunc_len
             self.can_run_list.append(req)
             self.new_chunked_req = req
@@ -1331,6 +1474,7 @@ class PrefillAdder:
                 compute_charge=trunc_len if self.exact_chunk_fill else None,
             )
 
+        self._commit_prefill_time_budget(req, time_limited=time_limited)
         return self.budget_state()
 
     def add_one_req(
@@ -1340,7 +1484,11 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(
+                req,
+                has_chunked_req=has_chunked_req,
+                truncation_align_size=truncation_align_size,
+            )
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1370,10 +1518,15 @@ class PrefillAdder:
         # The temporary pin excludes this prefix from the evictable budget.
         # Selection itself neither allocates slots nor materializes host hits.
         with self._lock_node(req.last_node):
+            selection_host_hit_length = req.host_hit_length
+            if self.prefill_time_budget is not None:
+                selection_host_hit_length = (
+                    self._prefill_time_load_back_prefix(req) - req.prefix_len
+                )
             admission = self._select_prefill_admission(
                 req,
                 total_tokens=total_tokens,
-                host_hit_length=req.host_hit_length,
+                host_hit_length=selection_host_hit_length,
                 swa_host_hit_length=req.swa_host_hit_length,
                 truncation_align_size=truncation_align_size,
                 has_chunked_req=has_chunked_req,
@@ -1471,10 +1624,19 @@ class PrefillAdder:
                             req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS
                         )
                     admission = _PrefillAdmission(
-                        prefix_len, extend_len, max_new_tokens, is_chunked
+                        prefix_len,
+                        extend_len,
+                        max_new_tokens,
+                        is_chunked,
+                        admission.time_limited and is_chunked,
                     )
-                elif req.host_loaded_length < promised_host_hit:
+                elif req.host_loaded_length < promised_host_hit or (
+                    self.prefill_time_budget is not None
+                    and req.host_loaded_length == 0
+                    and req.prefix_len != admission.prefix_len
+                ):
                     # No FULL was loaded; recomputation may no longer fit.
+                    # An aux-only restore can also fail with promised FULL=0.
                     admission = self._select_prefill_admission(
                         req,
                         total_tokens=total_tokens,
@@ -1578,10 +1740,34 @@ class PrefillAdder:
             max_new_tokens = 0
             tile_tokens = extend_len
 
+        time_limited = False
+        if self.prefill_time_budget is not None:
+            extend_len, time_limited = self._time_budget_token_limit(
+                prefix_len=prefix_len,
+                remaining_tokens=len(req.full_untruncated_fill_ids) - prefix_len,
+                token_limit=extend_len,
+                truncation_align_size=truncation_align_size,
+            )
+            if extend_len <= 0:
+                return AddReqResult.OTHER
+            is_chunked = prefix_len + extend_len < len(req.full_untruncated_fill_ids)
+            if is_chunked and (
+                has_chunked_req
+                or self.new_chunked_req is not None
+                or self._time_budget_has_continuation
+            ):
+                # A time cut can leave token budget for more complete requests,
+                # but the scheduler can only retain one unfinished chunk owner.
+                return AddReqResult.OTHER
+            max_new_tokens = 0 if is_chunked else max_new_tokens
+            tile_tokens = extend_len
+
         if (verdict := self._check_prefill_tile_budget(tile_tokens)) is not None:
             return verdict
 
-        return _PrefillAdmission(prefix_len, extend_len, max_new_tokens, is_chunked)
+        return _PrefillAdmission(
+            prefix_len, extend_len, max_new_tokens, is_chunked, time_limited
+        )
 
     def _commit_prefill_admission(
         self, req: Req, admission: _PrefillAdmission, mamba_gap_reserve: int
@@ -1604,6 +1790,7 @@ class PrefillAdder:
             # Compute budgets are billed forward-pass tokens under exact-chunk-fill.
             compute_charge=admission.extend_len if self.exact_chunk_fill else None,
         )
+        self._commit_prefill_time_budget(req, time_limited=admission.time_limited)
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
     def preempt_to_schedule(self, req: Req) -> bool:

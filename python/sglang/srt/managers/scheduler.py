@@ -15,6 +15,7 @@
 
 import dataclasses
 import faulthandler
+import json
 import logging
 import math
 import os
@@ -28,6 +29,7 @@ from functools import partial
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.observability.cache_observation import emit_cache_summary
 from sglang.srt.runtime_context import (
     SpawnRanks,
     attention_backends,
@@ -118,6 +120,7 @@ from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
+from sglang.srt.managers.dp_admission import SchedulerDPAdmission
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -269,6 +272,10 @@ from sglang.srt.managers.scheduler_components.output_streamer import (
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
+from sglang.srt.managers.scheduler_components.prefill_time_budget import (
+    PrefillTimeBudget,
+    PrefillTimeModel,
+)
 from sglang.srt.managers.scheduler_components.profiler_manager import (
     SchedulerProfilerManager,
 )
@@ -287,10 +294,12 @@ from sglang.srt.managers.utils import (
     EmbeddingBatchResult,
     GenerationBatchResult,
     allocate_distinct_stream,
+    compute_spec_context_reserve,
     is_health_check_generate_req,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
+from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -448,6 +457,8 @@ class Scheduler(
     SchedulerMlxOverlapMixin,
 ):
     """A scheduler that manages a tensor parallel GPU worker."""
+
+    spec_context_reserve: int = 0
 
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
@@ -709,6 +720,8 @@ class Scheduler(
 
         self.init_load_publisher()
 
+        self.init_dp_admission(port_args)
+
         self.init_load_inquirer()
 
         self.init_output_streamer()
@@ -856,18 +869,55 @@ class Scheduler(
         writer = self.load_snapshot_writer
         if writer is None:
             return None
-        if not force:
-            writer.publish_counter += 1
-            if writer.publish_counter < writer.publish_interval:
-                return None
-        writer.publish_counter = 0
         try:
+            admission = getattr(self, "dp_admission", None)
+            if admission is not None and not force:
+                # Check only the local ledger and allocator, not all serving
+                # queues, on ordinary decode iterations. Finished output alone
+                # never releases a commitment; snapshot() requires ownership to
+                # be gone and retains any still-used allocator tokens as a floor.
+                num_used, _ = (
+                    self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
+                )
+                current = admission.snapshot(num_used)
+                released, tokens = getattr(
+                    self, "_last_published_dp_admission", (0, None)
+                )
+                force = admission.num_released_requests != released or (
+                    tokens is not None
+                    and current["dp_admission_reserved_tokens"] < tokens
+                )
+            if not force:
+                writer.publish_counter += 1
+                if writer.publish_counter < writer.publish_interval:
+                    return None
+            writer.publish_counter = 0
             load = self.load_inquirer.get_loads()
-            writer.write(load)
+            written = writer.write(load)
+            if admission is not None and written is False:
+                return None
+            if admission is not None:
+                # A failed write must leave the release pending for the next
+                # iteration. One successful write coalesces every release in
+                # this batch, even when new admissions hide the net decrease.
+                self._last_published_dp_admission = (
+                    admission.num_released_requests,
+                    load.dp_admission_reserved_tokens,
+                )
             return load
         except Exception as e:
             logger.warning("load snapshot publish failed: %s", e)
             return None
+
+    def _publish_batch_load(self, batch: ScheduleBatch) -> None:
+        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
+        # Router-facing gauge on the dedicated PUB socket, reusing the
+        # snapshot above rather than walking the queues again.
+        self.load_publisher.publish_load_stat(
+            self.load_inquirer.get_loads,
+            force=batch.forward_mode.is_extend(),
+            snapshot=snapshot,
+        )
 
     def init_tokenizer(self):
         server_args = self.server_args
@@ -1187,6 +1237,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
+        self.spec_context_reserve = compute_spec_context_reserve(self.enable_overlap)
         # DFlash auto-enables the legacy formula; other workloads opt in via
         # --min-free-slots-delay. Built independently of the prefill delayer.
         self.min_free_slots_delayer: Optional[MinFreeSlotsDelayer] = None
@@ -1333,6 +1384,16 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
+        self.prefill_time_model = PrefillTimeModel.from_json(
+            get_schedule().prefill_time_model
+        )
+        if (
+            get_schedule().prefill_time_budget_ms is not None
+            and self.chunked_prefill_size is None
+        ):
+            raise ValueError(
+                "--prefill-time-budget-ms requires enabled chunked prefill."
+            )
         self.chunked_req = None
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
@@ -1721,6 +1782,21 @@ class Scheduler(
         longer than the chunk would wait in the queue forever."""
         align = self.truncation_align_size
         chunk = self.chunked_prefill_size
+        if getattr(self, "prefill_time_model", None) is not None:
+            shard_page = (
+                self.token_to_kv_pool_allocator.page_size
+                if getattr(self, "kv_shard_widening", 1) > 1
+                else 1
+            )
+            minimum_chunk = math.lcm(self.page_size, align or 1, shard_page)
+            hard_limit = min(chunk, self.max_prefill_tokens)
+            if hard_limit < minimum_chunk:
+                raise ValueError(
+                    "--prefill-time-budget-ms needs --chunked-prefill-size and "
+                    "--max-prefill-tokens to each fit a minimum aligned chunk "
+                    f"on every attention group ({minimum_chunk} tokens; "
+                    f"resolved limit {hard_limit})."
+                )
         if align is None or chunk is None or chunk >= align:
             return
         if self.disaggregation_mode == DisaggregationMode.DECODE:
@@ -2142,6 +2218,14 @@ class Scheduler(
         for recv_req in recv_reqs:
             # Before any early exit, so every request releases its CUDA IPC pool slot.
             for tokenized_req in self._tokenized_requests(recv_req):
+                admission = getattr(self, "dp_admission", None)
+                if admission is not None and isinstance(
+                    tokenized_req, TokenizedGenerateReqInput
+                ):
+                    # The loop is ordered and snapshots are published only after
+                    # input processing. ACK even busy health checks that return
+                    # before constructing a Req, so their reservation cannot leak.
+                    admission.acknowledge(tokenized_req)
                 if tokenized_req.positional_embed_overrides is not None:
                     tokenized_req.positional_embed_overrides.reconstruct(
                         get_device().gpu_id
@@ -2187,6 +2271,14 @@ class Scheduler(
         if get_disagg().enable_pd_role_switch and self._event_loop_should_restart:
             self._event_loop_should_restart = False
             raise role_switch.PdRoleSwitchRestart()
+
+    def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
+        """Report a request the scheduler ends outside the output stream
+        (aborted while queued, preempted, retracted or rejected)."""
+        admission = getattr(self, "dp_admission", None)
+        if admission is not None:
+            admission.mark_terminal(req)
+        self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     @staticmethod
     def _tokenized_requests(recv_req):
@@ -2474,6 +2566,30 @@ class Scheduler(
             publish_interval=get_observability().load_snapshot_publish_interval,
         )
 
+    def init_dp_admission(self, port_args: PortArgs) -> None:
+        self.dp_admission = None
+        if not get_parallel().enable_dp_admission:
+            return
+        if (
+            self.is_hybrid_swa
+            or self.is_hybrid_ssm
+            or self.model_config.is_multimodal
+            or not self.model_config.is_generation
+            or self.kv_shard_widening != 1
+        ):
+            raise ValueError(
+                "--enable-dp-admission requires a text generation model with "
+                "a single full-attention KV capacity (no SWA/SSM or KV sharding)."
+            )
+        self.dp_admission = SchedulerDPAdmission(
+            port_args.instance_id,
+            page_size=self.page_size,
+            decode_reserve=get_alloc_reserve_per_decode(),
+            prealloc_reserve=get_disagg().num_reserved_decode_tokens,
+            max_sequence_length=self.max_req_len,
+            max_new_tokens_limit=self.max_new_tokens_limit,
+        )
+
     def init_load_inquirer(self) -> None:
         self.total_prefill_uncached_tokens = 0
         self.total_prefill_busy_us = 0
@@ -2520,6 +2636,11 @@ class Scheduler(
             ),
             get_total_prefill_busy_us=lambda: self.total_prefill_busy_us,
             get_decode_moment_totals=lambda: self.decode_moment_totals,
+            get_dp_admission_snapshot=(
+                self.dp_admission.snapshot
+                if getattr(self, "dp_admission", None) is not None
+                else None
+            ),
         )
 
     def init_output_streamer(self) -> None:
@@ -2603,7 +2724,7 @@ class Scheduler(
             0,
             min(
                 max_new_tokens,
-                self.max_req_len - input_len - 1,
+                self.max_req_len - input_len - 1 - self.spec_context_reserve,
             ),
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
@@ -2817,6 +2938,16 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _create_generation_req(
+        self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
+    ) -> Req:
+        """Extension point for request-local state, including session requests."""
+        req = Req(*args, **kwargs)
+        admission = getattr(self, "dp_admission", None)
+        if admission is not None:
+            admission.bind(req, recv_req)
+        return req
+
     def handle_generate_request(
         self,
         recv_req: TokenizedGenerateReqInput,
@@ -2859,7 +2990,8 @@ class Scheduler(
                 recv_req.input_ids = array("q", [1]) * seq_length
 
             is_beam = BeamCoordinator.request_beam_width(recv_req) > 1
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -2953,6 +3085,9 @@ class Scheduler(
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 disagg_mode=self.disaggregation_mode,
             )
+            admission = getattr(self, "dp_admission", None)
+            if admission is not None:
+                admission.bind(req, recv_req)
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     session_id
@@ -2973,7 +3108,8 @@ class Scheduler(
                 )
             else:
                 error_msg = f"Invalid request: session id {session_id} does not exist"
-            req = Req(
+            req = self._create_generation_req(
+                recv_req,
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
@@ -3011,7 +3147,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self.send_abort_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3233,25 +3369,41 @@ class Scheduler(
 
             matched_len = req.prefix_len + req.host_hit_length
             req.storage_prefetch_last_match_len = matched_len
-
-            if (
+            obs = getattr(req, "cache_observation", None)
+            if obs is not None:
+                node_ids = {}
+                if req.prefix_len and isinstance(req.last_node, int):
+                    node_ids["l1"] = req.last_node
+                if req.host_hit_length and isinstance(last_host_node, int):
+                    node_ids["l2"] = last_host_node
+                obs.record_enqueue_match(
+                    req.prefix_len,
+                    req.host_hit_length,
+                    node_ids=node_ids,
+                    history=getattr(tree_cache, "node_mutation_history", None),
+                )
+            remaining_tokens = 0
+            result = None
+            anchor_eligible = (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
                 or (
                     buffer_mode
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
-            ):
+            )
+            if anchor_eligible:
                 match_end = req._compute_max_prefix_len(
                     len(req.full_untruncated_fill_ids)
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
+                remaining_tokens = len(new_input_tokens)
                 prefix_keys = (
                     tree_cache.get_prefix_hash_values(last_host_node)
                     if tree_cache.hicache_storage_pass_prefix_keys
                     else None
                 )
-                return tree_cache.prefetch_from_storage(
+                result = tree_cache.prefetch_from_storage(
                     req.cache_request_handle,
                     last_host_node,
                     new_input_tokens,
@@ -3262,6 +3414,30 @@ class Scheduler(
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
                 )
+            else:
+                tree_cache.release_prefetch_capacity_waiter(req.cache_request_handle)
+            pending_tokens = tree_cache.prefetch_capacity_pending_tokens(
+                req.cache_request_handle
+            )
+            if obs is not None:
+                pending = getattr(tree_cache, "ongoing_prefetch", {}).get(
+                    req.cache_request_handle
+                )
+                if pending is not None:
+                    obs.prefetch = pending.operation.cache_observation
+                now = time.monotonic()
+                if pending_tokens:
+                    obs.wait_start("capacity", now)
+                else:
+                    obs.wait_end("capacity", now)
+                obs.record_l3_prefetch_decision(
+                    anchor_eligible=anchor_eligible,
+                    remaining_tokens=remaining_tokens,
+                    pending_tokens=pending_tokens,
+                    operation_started=pending is not None,
+                )
+            # The official return value is the optional PP ticket decision.
+            return result
 
     def _process_storage_prefetch_retries(self):
         """Issue due L3 attempts in the current waiting-queue order."""
@@ -3322,6 +3498,9 @@ class Scheduler(
             previous_match_len,
             current_match_len,
         )
+        obs = getattr(req, "cache_observation", None)
+        if obs is not None:
+            obs.record_l3_admission_recheck(previous_match_len - current_match_len)
         self._retry_storage_prefetch(req)
         return True
 
@@ -3411,7 +3590,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
+            self.send_abort_output(abort_req, req)
             return False
         return True
 
@@ -3419,6 +3598,7 @@ class Scheduler(
         """Drop the cache-side state an aborted request left behind."""
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
+        emit_cache_summary(req, logger, outcome_override="aborted_before_output")
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
 
@@ -3454,7 +3634,7 @@ class Scheduler(
                 req_to_abort = candidate_req
                 message = "The request is aborted by a higher priority request."
 
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(
                 req_to_abort,
                 finished_reason={
@@ -3694,7 +3874,7 @@ class Scheduler(
         self._pending_chunked_abort_req = None
         # A client abort leaves the message to the tokenizer.
         finished_reason = req.discard_output_reason and reason.to_json()
-        self.ipc_channels.send_to_tokenizer.send_output(
+        self.send_abort_output(
             _make_abort_req(req, finished_reason=finished_reason), req
         )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
@@ -3924,6 +4104,82 @@ class Scheduler(
 
         return res
 
+    def _observe_hicache_prefill_no_batch(self, reason: str, skips=None) -> None:
+        """Log one bounded scheduler/FIFO snapshot during a sustained Prefill stall."""
+        if (
+            not self.enable_hicache_storage
+            or self.disaggregation_mode != DisaggregationMode.PREFILL
+        ):
+            return
+        if not self.waiting_queue and not self.disagg_prefill_bootstrap_queue.queue:
+            self._hicache_no_batch_since = 0.0
+            return
+        now = time.monotonic()
+        since = getattr(self, "_hicache_no_batch_since", 0.0)
+        if not since:
+            self._hicache_no_batch_since = now
+            return
+        last_log = getattr(self, "_hicache_no_batch_last_log", 0.0)
+        if now - since < 2.0 or (last_log and now - last_log < 10.0):
+            return
+        self._hicache_no_batch_last_log = now
+        if not self.metrics_reporter.is_stats_logging_rank:
+            return
+
+        controller = getattr(self.tree_cache, "cache_controller", None)
+        fifo = (
+            controller.prefetch_capacity_waiter_snapshot()
+            if controller is not None
+            else {}
+        )
+        head_rid = fifo.get("head_rid")
+        bootstrap_queue = self.disagg_prefill_bootstrap_queue.queue
+        head_stage = "absent"
+        head_pending_tokens = None
+        if head_rid is not None:
+            for stage, queue in (
+                ("waiting", self.waiting_queue),
+                ("bootstrap", bootstrap_queue),
+            ):
+                head_req = next((req for req in queue if req.rid == head_rid), None)
+                if head_req is not None:
+                    head_stage = stage
+                    head_pending_tokens = (
+                        self.tree_cache.prefetch_capacity_pending_tokens(
+                            head_req.cache_request_handle
+                        )
+                    )
+                    break
+        logger.warning(
+            "HiCache prefill_no_batch %s",
+            json.dumps(
+                dict(
+                    reason=reason,
+                    duration_seconds=round(now - since, 3),
+                    waiting_reqs=len(self.waiting_queue),
+                    waiting_capacity_pending=sum(
+                        self.tree_cache.prefetch_capacity_pending_tokens(
+                            req.cache_request_handle
+                        )
+                        > 0
+                        for req in self.waiting_queue
+                    ),
+                    bootstrap_reqs=len(bootstrap_queue),
+                    inflight_reqs=len(self.disagg_prefill_inflight_queue),
+                    running_reqs=len(self.running_batch.reqs),
+                    req_pool_available=self.req_to_token_pool.available_size(),
+                    head_stage=head_stage,
+                    head_pending_tokens=head_pending_tokens,
+                    fifo=fifo,
+                    skips=skips or {},
+                ),
+                separators=(",", ":"),
+            ),
+        )
+
+    def _observe_hicache_prefill_batch(self) -> None:
+        self._hicache_no_batch_since = 0.0
+
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
@@ -3939,6 +4195,8 @@ class Scheduler(
             prefill_delayer_single_pass=prefill_delayer_single_pass,
             running_batch=running_batch,
         )
+        if ret is not None:
+            self._observe_hicache_prefill_batch()
 
         if self.prefill_delayer:
             observed_prefill_bs = prefill_delayer_single_pass.finalize(
@@ -3973,6 +4231,7 @@ class Scheduler(
         if (
             running_batch.batch_is_full or len(self.waiting_queue) == 0
         ) and self.chunked_req is None:
+            self._observe_hicache_prefill_no_batch("batch_full_or_empty_queue")
             return None, running_batch
 
         running_bs = len(running_batch.reqs)
@@ -3987,6 +4246,7 @@ class Scheduler(
                 ),
             )
         ):
+            self._observe_hicache_prefill_no_batch("min_free_slots_delay")
             return None, running_batch
 
         # Ignore the check if self.chunked_req is not None.
@@ -4000,6 +4260,7 @@ class Scheduler(
             and not self.enable_priority_preemption
         ):
             running_batch.batch_is_full = True
+            self._observe_hicache_prefill_no_batch("no_request_slots")
             return None, running_batch
 
         # Get priority queue
@@ -4048,6 +4309,14 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            prefill_time_budget=(
+                PrefillTimeBudget(
+                    self.prefill_time_model, get_schedule().prefill_time_budget_ms
+                )
+                if get_schedule().prefill_time_budget_ms is not None
+                else None
+            ),
+            truncation_align_size=self.truncation_align_size,
         )
 
         if self.chunked_req is not None:
@@ -4077,9 +4346,11 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        no_batch_skips = {}
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                no_batch_skips["lora"] = no_batch_skips.get("lora", 0) + 1
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4111,14 +4382,46 @@ class Scheduler(
                 if not self.enable_priority_preemption or not adder.preempt_to_schedule(
                     req
                 ):
+                    no_batch_skips["batch_full"] = 1
                     break
+
+            if self.enable_hicache_storage:
+                pending_tokens = self.tree_cache.prefetch_capacity_pending_tokens(
+                    req.cache_request_handle
+                )
+                if pending_tokens:
+                    controller = self.tree_cache.cache_controller
+                    if controller.prefetch_rate_limited(pending_tokens, req.rid):
+                        no_batch_skips["capacity_gate"] = (
+                            no_batch_skips.get("capacity_gate", 0) + 1
+                        )
+                        continue
+                    # Capacity retries rematch before allocating, and do not
+                    # consume the official storage re-query attempt budget.
+                    self._prefetch_kvcache(req)
+                    if self.tree_cache.prefetch_capacity_pending_tokens(
+                        req.cache_request_handle
+                    ):
+                        no_batch_skips["capacity_retry_pending"] = (
+                            no_batch_skips.get("capacity_retry_pending", 0) + 1
+                        )
+                        continue
 
             if self.enable_hicache_storage or self.enable_lmcache:
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
+                obs = getattr(req, "cache_observation", None)
+                if obs is not None:
+                    if prefetch_done:
+                        obs.wait_end("prefetch", time.monotonic())
+                    else:
+                        obs.wait_start("prefetch", time.monotonic())
                 if not prefetch_done:
+                    no_batch_skips["prefetch_ongoing"] = (
+                        no_batch_skips.get("prefetch_ongoing", 0) + 1
+                    )
                     # skip staging requests that are ongoing prefetch
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
@@ -4137,22 +4440,46 @@ class Scheduler(
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
+                no_batch_skips["admission_recheck"] = (
+                    no_batch_skips.get("admission_recheck", 0) + 1
+                )
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
+                    no_batch_skips["staging_pending"] = (
+                        no_batch_skips.get("staging_pending", 0) + 1
+                    )
                     continue
+            admission_device = req.prefix_len
+            admission_host = req.host_hit_length
+            obs = getattr(req, "cache_observation", None)
+            node_mutations = (
+                obs.admission_node_mutations(admission_device, admission_host)
+                if obs is not None
+                else None
+            )
             res = adder.add_one_req(
                 req,
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+            added = bool(adder.can_run_list) and req is adder.can_run_list[-1]
+            if obs is not None:
+                obs.record_admission_match(
+                    admission_device,
+                    admission_host,
+                    added,
+                    res.name,
+                    node_mutations=node_mutations,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
+                no_batch_skips["adder_result"] = res.name
                 if res == AddReqResult.NO_TOKEN:
                     # Set batch_is_full after making sure there are requests that can be served
                     running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
@@ -4181,6 +4508,7 @@ class Scheduler(
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
         if len(can_run_list) == 0:
+            self._observe_hicache_prefill_no_batch("no_admission", no_batch_skips)
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
             for req in adder.preempt_list:
@@ -4389,7 +4717,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
                 abort_reason: FINISH_ABORT = req.to_finish
-                self.ipc_channels.send_to_tokenizer.send_output(
+                self.send_abort_output(
                     _make_abort_req(req, finished_reason=abort_reason.to_json()),
                     req,
                 )
@@ -4926,14 +5254,9 @@ class Scheduler(
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
-        snapshot = self.publish_load_snapshot(force=batch.forward_mode.is_extend())
-        # Router-facing gauge on the dedicated PUB socket, reusing the
-        # snapshot above rather than walking the queues again.
-        self.load_publisher.publish_load_stat(
-            self.load_inquirer.get_loads,
-            force=batch.forward_mode.is_extend(),
-            snapshot=snapshot,
-        )
+        admission_enabled = getattr(self, "dp_admission", None) is not None
+        if not admission_enabled:
+            self._publish_batch_load(batch)
 
         if batch.forward_mode.is_decode():
             self.batch_result_processor.process_batch_result_decode(batch, result)
@@ -4951,6 +5274,12 @@ class Scheduler(
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
+
+        if admission_enabled:
+            # Result processing has now streamed terminal outputs and completed
+            # allocator free_group_end(). Publish newly available admission
+            # capacity once, rather than waiting another decode interval.
+            self._publish_batch_load(batch)
 
         self._record_step_counters(batch, result)
 
@@ -5481,7 +5810,7 @@ class Scheduler(
             self.beam_coordinator.retire_group(req)
             # Without the initiator's reason the tokenizer falls back to a
             # generic abort message.
-            self.ipc_channels.send_to_tokenizer.send_output(
+            self.send_abort_output(
                 _make_abort_req(req, finished_reason=recv_req.finished_reason), req
             )
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
@@ -5509,9 +5838,7 @@ class Scheduler(
                 recv_req.abort_all, recv_req.rid
             ):
                 self._release_aborted_request(req)
-                self.ipc_channels.send_to_tokenizer.send_output(
-                    _make_abort_req(req), req
-                )
+                self.send_abort_output(_make_abort_req(req), req)
                 if req.kv.holds_kv or req.kv.holds_mamba:
                     release_kv_cache(req, self.tree_cache, checkpoint=False)
                 logger.debug(f"Abort dLLM queued request. {req.rid=}")
@@ -5574,9 +5901,7 @@ class Scheduler(
                             self.tree_cache,
                             get_disagg().disaggregation_decode_retraction_backup,
                         )
-                        self.ipc_channels.send_to_tokenizer.send_output(
-                            _make_abort_req(decode_req), decode_req
-                        )
+                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
                     else:
                         remaining_retracted.append(decode_req)
                 self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted

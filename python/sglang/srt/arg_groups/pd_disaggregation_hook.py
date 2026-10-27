@@ -96,6 +96,13 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             )
 
     if cfg.disaggregation_mode == "decode":
+        if envs.SGLANG_PD_DECODE_ENABLE_CACHE_REPORT.get():
+            declare_resolution(
+                server_args,
+                "handle_pd_disaggregation",
+                enable_cache_report=True,
+                stream_response_default_include_usage=True,
+            )
         if cfg.disaggregation_decode_enable_radix_cache:
             if cfg.enable_hisparse:
                 raise ValueError(

@@ -205,6 +205,17 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     num_prealloc_ready_tokens: int = 0
     max_total_num_tokens: int = 0
     max_running_requests: int = 0
+    # Opt-in decode admission protocol. The watermark acknowledges controller
+    # dispatches; a changing timestamp alone does not. Empty epoch means disabled.
+    dp_admission_epoch: str = ""
+    dp_admission_sequence: int = 0
+    dp_admission_reserved_tokens: int = 0
+    dp_admission_reserved_requests: int = 0
+    dp_admission_page_size: int = 0
+    dp_admission_decode_reserve: int = 0
+    dp_admission_prealloc_reserve: int = 0
+    dp_admission_max_seq_len: int = 0
+    dp_admission_max_new_tokens_limit: int = 0
     token_usage: float = 0.0
     gen_throughput: float = 0.0
     cache_hit_rate: float = 0.0
@@ -226,7 +237,11 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     )
 
     def to_dict(self, include: Optional[set[str]] = None) -> dict:
-        load = {key: getattr(self, key) for key in _CORE_KEYS}
+        load = {
+            key: getattr(self, key)
+            for key in _CORE_KEYS
+            if self.dp_admission_epoch or key not in _ADMISSION_FIELDS
+        }
 
         if include is None or "all" in include:
             include_all = True
@@ -257,6 +272,9 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
 # Flat scalar fields returned under "core": every struct field but the sections.
 _CORE_KEYS = tuple(
     f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
+)
+_ADMISSION_FIELDS = frozenset(
+    field for field in _CORE_KEYS if field.startswith("dp_admission_")
 )
 
 
@@ -403,7 +421,8 @@ class ZmqLoadSnapshotWriter:
         self._socket.setsockopt(_zmq.CONFLATE, 1)
         self._socket.connect(endpoint)
 
-    def write(self, snapshot: LoadSnapshot) -> None:
+    def write(self, snapshot: LoadSnapshot) -> bool:
+        """Return False if the nonblocking transport could not queue the snapshot."""
         if snapshot.dp_rank != self.dp_rank:
             raise ValueError(
                 f"snapshot dp_rank={snapshot.dp_rank} does not match "
@@ -412,7 +431,8 @@ class ZmqLoadSnapshotWriter:
         try:
             self._socket.send(snapshot_encoder.encode(snapshot), self._zmq.NOBLOCK)
         except self._zmq.Again:
-            pass
+            return False
+        return True
 
     def close(self) -> None:
         self._socket.close()
