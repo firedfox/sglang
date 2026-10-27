@@ -63,6 +63,22 @@ python -m pytest -q \
 
 缓存的完整用例清单与命令环境记录在部署包的验证附件中。部署包源码重放结果和源码 commit 由最终导出时的 `migration-manifest.json`、`stack.json` 及验证附件精确标识。
 
+## 实际导出补丁的完整重放
+
+已从发布的迁移提交 `71924fcad49c6a6be465ec35e2c3f60fa55a2324` 导出实际补丁，在干净的官方基线文件上执行安装器和 GNU patch，详细结果见 [`SOURCE_REPLAY.json`](SOURCE_REPLAY.json)。该记录验证真实部署差异，不只验证最小测试 fixture。
+
+- Python：53 个变更文件加 `version.py`，共 54 个受管路径，全部最终 SHA-256 和字节与已发布源码相同；语法解析通过。
+- 安装器：dry-run 不修改源码，完整安装成功，重复执行为 no-op；刻意制造的未知源码状态被拒绝且没有进一步写入；真实 bash 启动入口的 Python profile / import 检查通过。
+- Gateway：7 个 Rust 源码/测试路径的独立补丁零 fuzz 重放成功，最终字节与已发布源码一致。
+- 用户提供的 RBG：正向 JSON Patch 与候选完全一致，逆向操作精确恢复输入；6 个字段操作分别为两个镜像、两个 ConfigMap 引用和两份仅设置 tree backend 的 env 列表；其他角色不变。
+- 生成的不可变 ConfigMap 包含全部 5 个安装文件，data 为 466,139 字节，低于 1 MiB；所有导出文件 SHA-256 校验通过。
+
+Python 补丁 SHA-256：`8ec58a7ff36c0966f17e0bc001b1f61c92ed2af5382d1413eca22bd68a2b688c`。
+
+Gateway 补丁 SHA-256：`5b7152a965bd27db561bce0eed370806a35bf31d3e6b955a04ce308667aa31a7`。
+
+后续发布记录和导出器附件更新不改变这两份源码差异；最终交付包会再次记录其精确 source revision 和重放结果。上述检查基于官方 Git 字节，不代表已拉取或启动官方容器镜像。
+
 ## Rust Gateway
 
 Gateway 使用 release 的 Cargo 定义与 Rust 1.90 验证。HTTP PD 迁移按 release 的双请求结构适配；不存在对新 main decode gate 的依赖。测试所用锁文件随部署包的验证附件保存，不修改上游是否跟踪 `Cargo.lock` 的策略。锁文件 SHA-256 为 `baf76a88b79077de6d9bfb25a7dea4b0d620d85fffb971a41c4b4fc165dea60c`。

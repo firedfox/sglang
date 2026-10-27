@@ -52,6 +52,7 @@ python3 examples/runtime/glm53_pd/release_v0522/build_bundle.py \
 | `configmap.yaml` | 内容寻址、不可变的完整补丁 ConfigMap |
 | `gateway.patch` | 独立的 Rust Gateway 源码差异，供构建 Router 使用 |
 | `migration-manifest.json` | 官方基线、导出 revision、源码文件数和补丁哈希 |
+| `legacy-patches.json`、`SOURCE_REPLAY.json` | 原 32 补丁逐项覆盖及已发布迁移提交的真实重放记录 |
 | `review.json` | 部署候选、输入哈希和实际变更范围 |
 | `runtime-upgrade.patch.json` | 提供 RBG 时生成：替换 P/D 镜像、补丁 ConfigMap 引用，并显式设置 Python tree 环境变量 |
 | `runtime-upgrade.rollback.json` | 带校验条件的精确逆操作，恢复原镜像、ConfigMap 和环境变量 |
@@ -87,7 +88,7 @@ exec sglang serve <本角色已经审阅的参数>
 
 `python3` 和 `sglang` console script 必须使用同一 Python 环境；`check-source.py` 校验的是执行它的 Python。若自定义镜像含多个虚拟环境，应检查 `command -v python3`、`command -v sglang` 及该 console script 的解释器，确保服务使用同一份已打补丁源码。
 
-安装器只接受完整官方源码状态或完整候选状态。`upstream` 与 `baseline` 在本包中都代表相同的官方 0.5.22 字节，全部差异作为 extension 一次安装。它执行补丁哈希检查、零 fuzz 重放、最终源码哈希检查、文件原子替换和异常回滚；重复安装为 no-op。未知、部分修改或混合版本的源码会被拒绝，没有强制跳过开关。
+安装器验证补丁涉及的全部文件及 `version.py`：这些受管文件必须完整处于官方基线状态或候选状态；它不对仓库中其他未涉及的文件作完整性声明。`upstream` 与 `baseline` 在本包中都代表相同的官方 0.5.22 字节，全部差异作为 extension 一次安装。它执行补丁哈希检查、零 fuzz 重放、最终源码哈希检查、文件原子替换和异常回滚；重复安装为 no-op。受管文件中未知、部分修改或混合版本的状态会被拒绝，没有强制跳过开关。
 
 ## 应用与回滚
 

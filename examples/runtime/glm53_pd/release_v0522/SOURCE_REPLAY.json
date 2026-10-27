@@ -1,0 +1,63 @@
+{
+  "base_revision": "baa9befa381511cd4d56f83980951e5a45fffc6d",
+  "source_revision": "71924fcad49c6a6be465ec35e2c3f60fa55a2324",
+  "runtime_patch_sha256": "8ec58a7ff36c0966f17e0bc001b1f61c92ed2af5382d1413eca22bd68a2b688c",
+  "gateway_patch_sha256": "5b7152a965bd27db561bce0eed370806a35bf31d3e6b955a04ce308667aa31a7",
+  "python": {
+    "managed_paths": 54,
+    "dry_run": {
+      "applied": [],
+      "dry_run": true,
+      "final_state": "baseline",
+      "noop": false,
+      "planned": [
+        "0001-glm53-pd-runtime.patch"
+      ],
+      "state": "baseline",
+      "validated_patches": 1
+    },
+    "install": {
+      "applied": [
+        "0001-glm53-pd-runtime.patch"
+      ],
+      "dry_run": false,
+      "final_state": "candidate",
+      "noop": false,
+      "planned": [
+        "0001-glm53-pd-runtime.patch"
+      ],
+      "state": "baseline",
+      "validated_patches": 1
+    },
+    "repeated": {
+      "applied": [],
+      "dry_run": false,
+      "final_state": "candidate",
+      "noop": true,
+      "planned": [],
+      "state": "candidate",
+      "validated_patches": 1
+    },
+    "matches_committed_source": true,
+    "ast_parses": true,
+    "startup_check_passed": true,
+    "unknown_state_refused_without_changes": true
+  },
+  "gateway": {
+    "paths": 7,
+    "zero_fuzz_replay_passed": true,
+    "matches_committed_source": true
+  },
+  "deployment": {
+    "forward_matches_candidate": true,
+    "rollback_exact": true,
+    "changed_fields": 6,
+    "other_roles_unchanged": true,
+    "complete_immutable_configmap": true,
+    "data_bytes": 466139,
+    "all_export_checksums_match": true
+  },
+  "image_contents_inspected": false,
+  "gpu_validated": false,
+  "deployed": false
+}

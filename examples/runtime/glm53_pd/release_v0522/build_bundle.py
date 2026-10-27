@@ -375,6 +375,7 @@ def build_bundle(
             "MIGRATION.md",
             "VALIDATION.md",
             "legacy-patches.json",
+            "SOURCE_REPLAY.json",
         ):
             path = PACKAGE / name
             if path.exists():
