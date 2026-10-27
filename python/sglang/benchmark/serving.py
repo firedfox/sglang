@@ -120,6 +120,7 @@ class RequestFuncOutput:
     # None means the backend did not report a count. Never substitute the
     # requested output budget when auditing native SGLang responses.
     completion_tokens: int | None = None
+    server_prompt_tokens: int | None = None
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
@@ -295,8 +296,9 @@ def _record_server_prompt_len(data, output):
     """
     reported = data.get("usage") or data.get("meta_info") or {}
     prompt_tokens = reported.get("prompt_tokens")
-    if prompt_tokens:
+    if _nonnegative_int(prompt_tokens):
         output.prompt_len = prompt_tokens
+        output.server_prompt_tokens = prompt_tokens
 
 
 def _record_request_end(output: RequestFuncOutput) -> None:
@@ -349,6 +351,26 @@ def _request_speculative_metrics(outputs: list[RequestFuncOutput]) -> dict[str, 
         "verify_count": verify_count if complete else None,
         "correct_drafts": correct if draft_complete else None,
         "proposed_drafts": proposed if draft_complete else None,
+    }
+
+
+def _input_token_accounting(outputs, backend):
+    successful = [output for output in outputs if output.success]
+    covered = [
+        output for output in successful if output.server_prompt_tokens is not None
+    ]
+    complete = bool(successful) and len(covered) == len(successful)
+    source = "dataset_estimate"
+    if backend == "sglang-oai-chat" and covered:
+        source = "server_usage" if complete else "mixed_server_usage_and_dataset"
+    return {
+        "total_input_tokens_source": source,
+        "successful_requests": len(successful),
+        "requests_with_server_prompt_tokens": len(covered),
+        "server_prompt_tokens_total": (
+            sum(output.server_prompt_tokens for output in covered) if complete else None
+        ),
+        "vision_breakdown_source": "dataset_estimate",
     }
 
 
@@ -474,6 +496,180 @@ async def async_request_openai_completions(
     return output
 
 
+def _record_chat_speculative_metadata(data, choices, output):
+    """Read actual optional counters; old SGLang chat streams omit them.
+
+    v0.5.18 has no streaming spec extension and rejects return_meta_info with
+    stream=true. Do not request that unsupported option or invent counters from
+    a rank's average. Newer servers expose sglext.spec_tokens_details; older
+    non-streaming responses can expose choices[0].meta_info when requested.
+    """
+    sources = [choice.get("meta_info") for choice in choices]
+    details = (data.get("sglext") or {}).get("spec_tokens_details")
+    if isinstance(details, list):
+        details = details[0] if len(details) == 1 else None
+    sources.append(details)
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for name in (
+            "spec_verify_ct",
+            "spec_num_correct_drafts",
+            "spec_num_proposed_drafts",
+        ):
+            if name in source:
+                value = source[name]
+                setattr(output, name, value if _nonnegative_int(value) else None)
+        for name in (
+            "spec_accept_length",
+            "spec_cap_length",
+            "spec_block_accept_length",
+        ):
+            value = source.get(name)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+                and value >= 0
+            ):
+                setattr(output, name, value)
+        histogram = source.get("spec_cap_lens_histogram")
+        if isinstance(histogram, list) and all(map(_nonnegative_int, histogram)):
+            output.spec_cap_lens_histogram = histogram
+
+
+async def _read_sglang_chat_response(response, payload, output, started):
+    """Audit the SGLang chat protocol without changing other OAI backends."""
+    streaming = payload["stream"]
+    normal_reasons = {"stop", "length", "tool_calls", "function_call", "content_filter"}
+    saw_done = False
+    saw_choice = False
+    saw_final_usage = False
+    most_recent_timestamp = None
+    first_count_timestamp = None
+
+    def record(data):
+        nonlocal \
+            saw_choice, \
+            saw_final_usage, \
+            most_recent_timestamp, \
+            first_count_timestamp
+        if not isinstance(data, dict):
+            raise ValueError("Expected a SGLang chat response object")
+        timestamp = time.perf_counter()
+        choices = data.get("choices") or []
+        if not isinstance(choices, list) or len(choices) > 1:
+            raise ValueError("SGLang chat benchmark requires one response choice")
+        choice = choices[0] if choices else None
+        if choice is not None:
+            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+                raise ValueError("SGLang chat benchmark requires choice index zero")
+            saw_choice = True
+            if choice.get("finish_reason") is not None:
+                output.finish_reason = choice["finish_reason"]
+
+        usage = data.get("usage") or {}
+        if not isinstance(usage, dict):
+            raise ValueError("Invalid SGLang chat usage object")
+        if "completion_tokens" in usage:
+            count = usage["completion_tokens"]
+            if not _nonnegative_int(count):
+                raise ValueError("Invalid SGLang chat usage.completion_tokens")
+            if (
+                output.completion_tokens is not None
+                and count < output.completion_tokens
+            ):
+                raise ValueError("SGLang chat completion_tokens decreased in a stream")
+            output.completion_tokens = output.output_len = count
+            if count > 0 and first_count_timestamp is None:
+                first_count_timestamp = timestamp
+            # continuous_usage_stats may report intermediate counts. Only a
+            # usage-only or terminal choice's usage can finalize accounting.
+            if (
+                not streaming
+                or not choices
+                or choice.get("finish_reason") in normal_reasons
+            ):
+                saw_final_usage = True
+        if "prompt_tokens" in usage and not _nonnegative_int(usage["prompt_tokens"]):
+            raise ValueError("Invalid SGLang chat usage.prompt_tokens")
+        _record_server_prompt_len(data, output)
+        _record_chat_speculative_metadata(data, choices, output)
+
+        if getattr(args, "cache_report", False):
+            cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+            if _nonnegative_int(cached):
+                output.cached_tokens = cached
+            _extract_cache_from_sglext(data, output)
+
+        if data.get("error") is not None:
+            raise ValueError(f"SGLang chat response error: {data['error']}")
+        if (
+            output.finish_reason is not None
+            and output.finish_reason not in normal_reasons
+        ):
+            raise ValueError(f"SGLang chat request failed: {output.finish_reason}")
+
+        if choice is not None:
+            message = choice.get("delta" if streaming else "message") or {}
+            content = _combine_openai_chat_content(message)
+            # Tool-only output is observable even when visible text is empty.
+            # Keep ITL/text_chunks paired only for text, so retokenization never
+            # divides an empty tool delta's interval by zero tokens.
+            first_tool = most_recent_timestamp is None and bool(
+                message.get("tool_calls") or message.get("function_call")
+            )
+            if content or first_tool:
+                if most_recent_timestamp is None:
+                    output.ttft = timestamp - started
+                elif content:
+                    output.itl.append(timestamp - most_recent_timestamp)
+                    output.text_chunks.append(content)
+                most_recent_timestamp = timestamp
+                output.generated_text += content
+
+    if not streaming:
+        record(await response.json(loads=orjson.loads))
+    else:
+        async for chunk_bytes in response.content:
+            chunk_bytes = chunk_bytes.strip()
+            if not chunk_bytes or chunk_bytes.startswith(
+                (b":", b"event:", b"id:", b"retry:")
+            ):
+                continue
+            chunk = (
+                chunk_bytes[5:].lstrip()
+                if chunk_bytes.startswith(b"data:")
+                else chunk_bytes
+            )
+            if chunk == b"[DONE]":
+                saw_done = True
+                break
+            record(orjson.loads(chunk))
+
+    if output.completion_tokens is None or not saw_final_usage:
+        raise ValueError(
+            "SGLang chat response ended without final usage.completion_tokens; "
+            "stream_options.include_usage must not be disabled"
+        )
+    if not saw_choice:
+        raise ValueError("SGLang chat response ended without a response choice")
+    if streaming and not saw_done and output.finish_reason not in normal_reasons:
+        raise ValueError(
+            "SGLang chat stream ended without a terminal finish_reason or [DONE]"
+        )
+    if output.completion_tokens == 0:
+        output.ttft = 0.0
+    elif not streaming:
+        output.ttft = time.perf_counter() - started
+    elif most_recent_timestamp is None:
+        # No visible text/tool tokens (e.g. skipped special tokens). The first
+        # positive usage report is the first observable evidence of output.
+        output.ttft = first_count_timestamp - started
+    output.success = True
+    output.latency = time.perf_counter() - started
+
+
 async def async_request_openai_chat_completions(
     request_func_input: RequestFuncInput,
     pbar: Optional[tqdm] = None,
@@ -493,6 +689,7 @@ async def async_request_openai_chat_completions(
                            latency, TTFT, ITL, and success status.
     """
     api_url = request_func_input.api_url
+    audit_sglang = getattr(args, "backend", None) == "sglang-oai-chat"
     assert api_url.endswith("chat/completions"), (
         "OpenAI Chat Completions API URL must end with 'chat/completions'."
     )
@@ -568,12 +765,25 @@ async def async_request_openai_chat_completions(
         output.start_time = st
         most_recent_timestamp = st
         try:
+            if audit_sglang and payload.get("n", 1) != 1:
+                raise ValueError("SGLang chat benchmark accounting requires n=1")
+            if audit_sglang and payload["stream"]:
+                # Do not mutate caller-owned options, or overwrite an explicit
+                # false. Missing final usage fails with an actionable audit error.
+                options = payload.get("stream_options")
+                if options is not None and not isinstance(options, dict):
+                    raise ValueError("SGLang chat stream_options must be an object")
+                options = dict(options or {})
+                options.setdefault("include_usage", True)
+                payload["stream_options"] = options
             async with session.post(
                 url=api_url, json=payload, headers=headers
             ) as response:
                 output.http_status = response.status
                 if response.status == 200:
-                    if args.disable_stream:
+                    if audit_sglang:
+                        await _read_sglang_chat_response(response, payload, output, st)
+                    elif args.disable_stream:
                         # Non-streaming response
                         response_json = await response.json()
                         message = response_json["choices"][0]["message"]
@@ -666,6 +876,8 @@ async def async_request_openai_chat_completions(
             output.error = "".join(traceback.format_exception(*exc_info))
         finally:
             _record_request_end(output)
+            if audit_sglang:
+                output.latency = output.end_time - st
 
     # TODO put it to other functions when `pbar` logic is refactored
     if getattr(args, "print_requests", False):
@@ -1207,7 +1419,8 @@ class BenchmarkMetrics:
     # Concurrency and peak metrics
     concurrency: float
     inflight_concurrency: float = 0.0
-    max_output_tokens_per_s: float = 0.0
+    max_output_tokens_per_s: float | None = 0.0
+    max_output_tokens_per_s_source: str = "legacy_client_token_interpolation"
     max_concurrent_requests: int = 0
 
 
@@ -1328,7 +1541,25 @@ def calculate_metrics(
                 tokenizer.encode(outputs[i].generated_text, add_special_tokens=False)
             )
             retokenized_output_lens.append(retokenized_output_len)
-            if input_requests is not None:
+            if backend == "sglang-oai-chat":
+                # Chat templates can change prompt length from the dataset's
+                # estimate. Prefer actual server usage, including multi-turn
+                # requests. A missing count remains explicitly marked as an
+                # estimate in input_token_accounting and request_details.
+                prompt_tokens = outputs[i].server_prompt_tokens
+                if prompt_tokens is None:
+                    prompt_tokens = outputs[i].prompt_len
+                vision_tokens = (
+                    min(input_requests[i].vision_prompt_len, prompt_tokens)
+                    if input_requests is not None
+                    else 0
+                )
+                total_input += prompt_tokens
+                # Usage reports the total; the image split is still estimated
+                # by the dataset. Attribute chat-template overhead to text.
+                total_input_vision += vision_tokens
+                total_input_text += prompt_tokens - vision_tokens
+            elif input_requests is not None:
                 total_input += input_requests[i].prompt_len
                 total_input_text += input_requests[i].text_prompt_len
                 total_input_vision += input_requests[i].vision_prompt_len
@@ -1362,7 +1593,11 @@ def calculate_metrics(
             stacklevel=2,
         )
 
-    max_output_tokens_per_s = 0.0
+    # Chat deltas may contain multiple target/draft tokens. Final usage gives
+    # the total, but cannot reconstruct per-token arrival times or their peak.
+    # Do not label chunk counts (or a uniform redistribution) as token rate.
+    chat_peak_unknown = backend == "sglang-oai-chat"
+    max_output_tokens_per_s = None if chat_peak_unknown else 0.0
     max_concurrent_requests, inflight_time, inflight_times, inflight_counts = (
         _inflight_timeline(outputs)
     )
@@ -1392,7 +1627,7 @@ def calculate_metrics(
                 if 0 <= second_bucket < duration_seconds:
                     tokens_per_second[second_bucket] += 1
 
-        if len(tokens_per_second) > 0:
+        if len(tokens_per_second) > 0 and not chat_peak_unknown:
             max_output_tokens_per_s = float(np.max(tokens_per_second))
 
         if plot_throughput:
@@ -1403,7 +1638,11 @@ def calculate_metrics(
                 fig.plot(
                     np.arange(len(tokens_per_second)),
                     tokens_per_second,
-                    title="Output tokens per second",
+                    title=(
+                        "Client output observations per second (not tokens)"
+                        if chat_peak_unknown
+                        else "Output tokens per second"
+                    ),
                     xlabel="Time (s)",
                 )
                 fig.plot(
@@ -1438,6 +1677,11 @@ def calculate_metrics(
         concurrency=np.sum(e2e_latencies) / dur_s,
         inflight_concurrency=inflight_time / dur_s,
         max_output_tokens_per_s=max_output_tokens_per_s,
+        max_output_tokens_per_s_source=(
+            "unavailable_without_per_token_timestamps"
+            if chat_peak_unknown
+            else "legacy_client_token_interpolation"
+        ),
         max_concurrent_requests=max_concurrent_requests,
     )
 
@@ -1903,9 +2147,13 @@ async def benchmark(
             )
         )
         print(
-            "{:<40} {:<10.2f}".format(
+            "{:<40} {:<10}".format(
                 "Peak output token throughput (tok/s):",
-                metrics.max_output_tokens_per_s,
+                (
+                    "N/A (no per-token timestamps)"
+                    if metrics.max_output_tokens_per_s is None
+                    else f"{metrics.max_output_tokens_per_s:.2f}"
+                ),
             )
         )
     print(
@@ -2041,6 +2289,7 @@ async def benchmark(
             )
         ),
         "total_input_tokens": metrics.total_input,
+        "input_token_accounting": _input_token_accounting(outputs, backend),
         "total_input_text_tokens": metrics.total_input_text,
         "total_input_vision_tokens": metrics.total_input_vision,
         "total_output_tokens": metrics.total_output,
@@ -2079,6 +2328,7 @@ async def benchmark(
         "accept_length_source": accept_length_source,
         "request_speculative_metrics": request_speculative_metrics,
         "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
+        "max_output_tokens_per_s_source": metrics.max_output_tokens_per_s_source,
         "max_concurrent_requests": metrics.max_concurrent_requests,
     }
 
@@ -2136,6 +2386,12 @@ async def benchmark(
                 "latency": output.latency,
                 "ttft": output.ttft,
                 "prompt_tokens": output.prompt_len,
+                "server_prompt_tokens": output.server_prompt_tokens,
+                "prompt_tokens_source": (
+                    "server"
+                    if output.server_prompt_tokens is not None
+                    else "dataset_estimate"
+                ),
                 "completion_tokens": output.completion_tokens,
                 "cached_tokens": output.cached_tokens,
                 "cache_details": output.cached_tokens_details,

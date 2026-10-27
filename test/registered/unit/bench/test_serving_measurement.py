@@ -1,4 +1,4 @@
-"""CPU regression tests for serving benchmark accounting and native SSE.
+"""CPU regression tests for serving benchmark accounting and native/chat SSE.
 
 Exercise the real HTTP request function and benchmark orchestration. No model,
 GPU, tokenizer download, or external service is needed.
@@ -15,9 +15,10 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import requests
+
 from sglang.benchmark import serving
 from sglang.benchmark.datasets import DatasetRow
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -35,6 +36,29 @@ def _chunk(tokens, text="hello", **meta):
         "text": text,
         "meta_info": {"prompt_tokens": 8, "completion_tokens": tokens, **meta},
     }
+
+
+def _chat_delta(content=None, *, reasoning=None, finish=None, tool_calls=None):
+    return {
+        "choices": [
+            {
+                "index": 0,
+                "delta": {
+                    "content": content,
+                    "reasoning_content": reasoning,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": finish,
+            }
+        ]
+    }
+
+
+def _chat_usage(tokens, prompt_tokens=13):
+    usage = {"completion_tokens": tokens}
+    if prompt_tokens is not None:
+        usage["prompt_tokens"] = prompt_tokens
+    return {"choices": [], "usage": usage}
 
 
 @contextmanager
@@ -149,10 +173,11 @@ class TestServingMeasurement(unittest.TestCase):
             return result, server.bodies
 
     def _benchmark(self, base_url, count=2, profile=False):
+        backend = self.args.backend
         return asyncio.run(
             serving.benchmark(
-                backend="sglang",
-                api_url=base_url + "/generate",
+                backend=backend,
+                api_url=base_url + serving._BACKEND_API_PATHS[backend],
                 base_url=base_url,
                 model_id="test-model",
                 tokenizer=_Tokenizer(),
@@ -496,6 +521,394 @@ class TestServingMeasurement(unittest.TestCase):
         self.assertEqual(summary["requests_with_verify_counters"], 1)
         self.assertIsNone(summary["accept_length"])
         self.assertIsNone(summary["verify_count"])
+
+    def _run_chat(self, reply, *, extra=None):
+        self.args.backend = "sglang-oai-chat"
+        with _native_server(reply) as (server, url):
+            request = self._request(url)
+            request.api_url = url + "/v1/chat/completions"
+            request.extra_request_body = extra if extra is not None else {}
+            result = asyncio.run(serving.async_request_openai_chat_completions(request))
+            self.assertGreater(result.end_time, result.start_time)
+            self.assertAlmostEqual(result.latency, result.end_time - result.start_time)
+            return result, server.bodies
+
+    def test_chat_real_usage_overrides_output_budget_and_prompt_estimate(self):
+        extra = {"stream_options": {"continuous_usage_stats": True}}
+        usage = _chat_usage(2)
+        usage["usage"]["prompt_tokens_details"] = {"cached_tokens": 7}
+        result, bodies = self._run_chat(
+            {
+                "chunks": [
+                    _chat_delta(reasoning="thinking "),
+                    _chat_delta("answer", finish="length"),
+                    usage,
+                ]
+            },
+            extra=extra,
+        )
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.generated_text, "thinking answer")
+        self.assertEqual((result.output_len, result.completion_tokens), (2, 2))
+        self.assertEqual((result.prompt_len, result.server_prompt_tokens), (13, 13))
+        self.assertEqual(result.cached_tokens, 7)
+        self.assertEqual(result.finish_reason, "length")
+        self.assertIsNone(result.spec_verify_ct)
+        self.assertEqual(extra, {"stream_options": {"continuous_usage_stats": True}})
+        self.assertEqual(
+            bodies[0]["stream_options"],
+            {"include_usage": True, "continuous_usage_stats": True},
+        )
+        self.assertNotIn("return_meta_info", bodies[0])
+        self.assertGreater(result.ttft, 0)
+        metrics, _ = serving.calculate_metrics(
+            [DatasetRow(prompt="estimate", prompt_len=8, output_len=16)],
+            [result],
+            1,
+            _Tokenizer(),
+            "sglang-oai-chat",
+        )
+        self.assertEqual(metrics.total_input, 13)
+        self.assertEqual(metrics.total_input_text, 13)
+        self.assertEqual(metrics.total_output, 2)
+
+    def test_chat_terminal_reason_or_done_is_sufficient_with_final_usage(self):
+        for reason in (
+            "stop",
+            "length",
+            "tool_calls",
+            "function_call",
+            "content_filter",
+            None,
+        ):
+            with self.subTest(reason=reason):
+                result, _ = self._run_chat(
+                    {
+                        "chunks": [
+                            _chat_delta("answer", finish=reason),
+                            _chat_usage(1),
+                        ],
+                        "done": reason is None,
+                    }
+                )
+                self.assertTrue(result.success, result.error)
+                self.assertEqual(result.finish_reason, reason)
+
+    def test_chat_partial_eof_and_error_never_count_successful_tokens(self):
+        replies = (
+            {"chunks": [_chat_delta("partial"), _chat_usage(2)], "done": False},
+            {
+                "chunks": [
+                    _chat_delta("partial"),
+                    _chat_usage(2),
+                    {"error": {"message": "upstream disconnected"}},
+                ]
+            },
+            {
+                "chunks": [
+                    _chat_delta("partial"),
+                    _chat_usage(2),
+                    _chat_delta(finish="abort"),
+                ]
+            },
+            {
+                "chunks": [
+                    _chat_delta("partial"),
+                    _chat_usage(2),
+                    _chat_delta(finish="error"),
+                ]
+            },
+        )
+        for reply in replies:
+            with self.subTest(reply=reply):
+                result, _ = self._run_chat(reply)
+                self.assertFalse(result.success)
+                self.assertEqual(result.http_status, 200)
+                self.assertEqual(result.completion_tokens, 2)
+                self.assertEqual(result.generated_text, "partial")
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    metrics, lengths = serving.calculate_metrics(
+                        None, [result], 1, _Tokenizer(), "sglang-oai-chat"
+                    )
+                self.assertEqual(
+                    (metrics.completed, metrics.total_output, lengths), (0, 0, [0])
+                )
+
+    def test_chat_missing_usage_and_disabled_usage_are_auditable_failures(self):
+        replies = (
+            {"chunks": []},
+            {"chunks": [_chat_delta("answer", finish="length")]},
+            {"chunks": [{"error": {"message": "failed"}}]},
+            {"chunks": [_chat_usage(1)]},
+        )
+        for reply in replies:
+            with self.subTest(reply=reply):
+                result, _ = self._run_chat(reply)
+                self.assertFalse(result.success)
+                self.assertTrue(result.error)
+        options = {"stream_options": {"include_usage": False}}
+        result, bodies = self._run_chat(
+            {"chunks": [_chat_delta("answer", finish="stop")]},
+            extra=options,
+        )
+        self.assertFalse(result.success)
+        self.assertIsNone(result.completion_tokens)
+        self.assertIn("stream_options.include_usage must not be disabled", result.error)
+        self.assertIs(bodies[0]["stream_options"]["include_usage"], False)
+
+    def test_chat_intermediate_or_invalid_usage_does_not_finalize_accounting(self):
+        intermediate = _chat_delta("partial")
+        intermediate["usage"] = {"completion_tokens": 1}
+        replies = [
+            {"chunks": [intermediate, _chat_delta(finish="length")]},
+            {"chunks": [_chat_delta("partial"), _chat_usage(2), _chat_usage(1)]},
+        ]
+        replies.extend(
+            {"chunks": [_chat_delta("answer", finish="stop"), _chat_usage(value)]}
+            for value in (True, -1, "2", None)
+        )
+        for reply in replies:
+            with self.subTest(reply=reply):
+                result, _ = self._run_chat(reply)
+                self.assertFalse(result.success)
+                self.assertTrue(result.error)
+
+    def test_chat_tool_only_and_zero_output_have_honest_timing(self):
+        tool = [{"index": 0, "function": {"name": "lookup", "arguments": "{}"}}]
+        result, _ = self._run_chat(
+            {
+                "chunks": [
+                    _chat_delta(tool_calls=tool),
+                    _chat_delta(finish="tool_calls"),
+                    _chat_usage(4),
+                ]
+            }
+        )
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.generated_text, "")
+        self.assertGreater(result.ttft, 0)
+        self.assertEqual(result.itl, [])
+        metrics, _ = serving.calculate_metrics(
+            None, [result], 1, _Tokenizer(), "sglang-oai-chat", accept_length=9
+        )
+        self.assertEqual(metrics.total_output, 4)
+        zero, _ = self._run_chat(
+            {"chunks": [_chat_delta(finish="stop"), _chat_usage(0)]}
+        )
+        self.assertTrue(zero.success, zero.error)
+        self.assertEqual(zero.ttft, 0)
+        metrics, _ = serving.calculate_metrics(
+            None, [zero], 1, _Tokenizer(), "sglang-oai-chat"
+        )
+        self.assertIsNone(metrics.mean_ttft_ms)
+        self.assertIsNone(metrics.max_output_tokens_per_s)
+
+    def test_chat_nonstream_usage_and_actual_optional_spec_metadata(self):
+        self.args.disable_stream = True
+        for location in ("sglext", "meta_info", "absent"):
+            with self.subTest(location=location):
+                body = {
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "reasoning_content": "think ",
+                                "content": "answer",
+                            },
+                            "finish_reason": "length",
+                        }
+                    ],
+                    "usage": {"completion_tokens": 6, "prompt_tokens": 13},
+                }
+                counters = {
+                    "spec_verify_ct": 2,
+                    "spec_num_correct_drafts": 3,
+                    "spec_num_proposed_drafts": 8,
+                }
+                if location == "sglext":
+                    body["sglext"] = {"spec_tokens_details": counters}
+                elif location == "meta_info":
+                    body["choices"][0]["meta_info"] = counters
+                result, bodies = self._run_chat({"json": body})
+                self.assertTrue(result.success, result.error)
+                self.assertFalse(bodies[0]["stream"])
+                self.assertEqual(result.generated_text, "think answer")
+                self.assertEqual(result.completion_tokens, 6)
+                metrics = serving._request_speculative_metrics([result])
+                self.assertEqual(
+                    metrics["accept_length"], None if location == "absent" else 3
+                )
+                self.assertEqual(
+                    metrics["accept_rate"], None if location == "absent" else 3 / 8
+                )
+        result, _ = self._run_chat(
+            {
+                "json": {
+                    "choices": [
+                        {"message": {"content": "answer"}, "finish_reason": "stop"}
+                    ]
+                }
+            }
+        )
+        self.assertFalse(result.success)
+        self.assertIsNone(result.completion_tokens)
+
+    def test_chat_new_server_spec_extension_is_read_from_final_empty_choice_chunk(self):
+        result, _ = self._run_chat(
+            {
+                "chunks": [
+                    _chat_delta("answer", finish="length"),
+                    {
+                        "choices": [],
+                        "sglext": {
+                            "spec_tokens_details": {
+                                "spec_verify_ct": 2,
+                                "spec_num_correct_drafts": 3,
+                                "spec_num_proposed_drafts": 8,
+                            }
+                        },
+                    },
+                    _chat_usage(6),
+                ]
+            }
+        )
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(
+            serving._request_speculative_metrics([result])["accept_length"], 3
+        )
+
+    def test_chat_missing_prompt_usage_retains_explicit_estimate_source(self):
+        missing, _ = self._run_chat(
+            {"chunks": [_chat_delta("answer"), _chat_usage(1, None)]}
+        )
+        present, _ = self._run_chat(
+            {"chunks": [_chat_delta("answer"), _chat_usage(1, 0)]}
+        )
+        self.assertTrue(missing.success, missing.error)
+        self.assertTrue(present.success, present.error)
+        self.assertIsNone(missing.server_prompt_tokens)
+        self.assertEqual(present.server_prompt_tokens, 0)
+        self.assertEqual(missing.prompt_len, 8)
+        accounting = serving._input_token_accounting(
+            [missing, present], "sglang-oai-chat"
+        )
+        self.assertEqual(
+            accounting["total_input_tokens_source"], "mixed_server_usage_and_dataset"
+        )
+        self.assertEqual(accounting["requests_with_server_prompt_tokens"], 1)
+        self.assertIsNone(accounting["server_prompt_tokens_total"])
+        metrics, _ = serving.calculate_metrics(
+            None, [missing, present], 1, _Tokenizer(), "sglang-oai-chat"
+        )
+        self.assertEqual(metrics.total_input, 8)
+
+    def test_chat_all_failed_run_keeps_http_and_partial_audit_details(self):
+        self.args.backend = "sglang-oai-chat"
+        with (
+            _native_server(
+                {"chunks": [_chat_delta("partial"), _chat_usage(2)], "done": False}
+            ) as (_, url),
+            warnings.catch_warnings(),
+        ):
+            warnings.simplefilter("ignore")
+            result = self._benchmark(url)
+        saved = self._saved_result()
+        self.assertEqual(
+            (
+                saved["completed"],
+                saved["failed_requests"],
+                saved["total_output_tokens"],
+            ),
+            (0, 2, 0),
+        )
+        self.assertEqual(saved["http_status_counts"], {"200": 2})
+        self.assertIsNone(saved["mean_tpot_ms"])
+        self.assertEqual(result["request_details"], saved["request_details"])
+        for detail in saved["request_details"]:
+            self.assertEqual(detail["completion_tokens"], 2)
+            self.assertEqual(detail["server_prompt_tokens"], 13)
+            self.assertEqual(detail["prompt_tokens_source"], "server")
+
+    def test_chat_success_summary_uses_server_prompt_counts_with_coverage(self):
+        self.args.backend = "sglang-oai-chat"
+        with _native_server(
+            {"chunks": [_chat_delta("answer", finish="length"), _chat_usage(3)]}
+        ) as (_, url):
+            self._benchmark(url)
+        saved = self._saved_result()
+        self.assertEqual(saved["total_input_tokens"], 26)
+        self.assertEqual(saved["total_output_tokens"], 6)
+        self.assertIsNone(saved["max_output_tokens_per_s"])
+        self.assertEqual(
+            saved["max_output_tokens_per_s_source"],
+            "unavailable_without_per_token_timestamps",
+        )
+        self.assertEqual(
+            saved["input_token_accounting"]["total_input_tokens_source"], "server_usage"
+        )
+        self.assertEqual(
+            saved["input_token_accounting"]["server_prompt_tokens_total"], 26
+        )
+        self.assertEqual(
+            saved["request_speculative_metrics"]["requests_with_verify_counters"], 0
+        )
+        self.assertIsNone(saved["request_speculative_metrics"]["accept_length"])
+
+    def test_other_chat_backend_retains_legacy_success_and_payload(self):
+        self.args.backend = "vllm-chat"
+        with _native_server({"chunks": [_chat_delta("answer")]}) as (server, url):
+            request = self._request(url)
+            request.api_url = url + "/v1/chat/completions"
+            result = asyncio.run(serving.async_request_openai_chat_completions(request))
+        self.assertTrue(result.success, result.error)
+        self.assertEqual(result.output_len, 16)
+        self.assertNotIn("stream_options", server.bodies[0])
+
+    def test_chat_plot_does_not_label_chunk_counts_as_tokens(self):
+        output = serving.RequestFuncOutput(
+            success=True,
+            start_time=1,
+            end_time=2,
+            latency=1,
+            output_len=1024,
+            completion_tokens=1024,
+            ttft=0.1,
+            itl=[0.3],
+        )
+        plot = MagicMock()
+        with (
+            patch.dict(
+                "sys.modules", {"termplotlib": SimpleNamespace(figure=lambda: plot)}
+            ),
+            patch.object(serving, "TERM_PLOTLIB_AVAILABLE", True),
+        ):
+            metrics, _ = serving.calculate_metrics(
+                None,
+                [output],
+                1,
+                _Tokenizer(),
+                "sglang-oai-chat",
+                plot_throughput=True,
+            )
+        self.assertIsNone(metrics.max_output_tokens_per_s)
+        self.assertIn("not tokens", plot.plot.call_args_list[0].kwargs["title"])
+
+    def test_chat_http_rejections_and_unsupported_multiple_choices_are_failures(self):
+        for status in (429, 503):
+            with self.subTest(status=status):
+                result, _ = self._run_chat(
+                    {"status": status, "json": {"error": "capacity unavailable"}}
+                )
+                self.assertFalse(result.success)
+                self.assertEqual(result.http_status, status)
+                self.assertIsNone(result.completion_tokens)
+                self.assertIn("capacity unavailable", result.error)
+        result, bodies = self._run_chat({"chunks": []}, extra={"n": 2})
+        self.assertFalse(result.success)
+        self.assertIsNone(result.http_status)
+        self.assertEqual(bodies, [])
+        self.assertIn("requires n=1", result.error)
 
 
 if __name__ == "__main__":
